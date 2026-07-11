@@ -1,12 +1,47 @@
 "use strict";
 
-const API_BASE_URL = (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
-  ? ""
-  : "https://arenaiq-e22w.onrender.com";
+/**
+ * @fileoverview ArenaIQ — client-side application logic.
+ *
+ * Handles all DOM interactions, API calls, localization switching, and
+ * dynamic result rendering for the ArenaIQ stadium assistant single-page
+ * application. No framework dependencies — plain ES2021 vanilla JS.
+ *
+ * Architecture:
+ *   - On DOMContentLoaded, `init()` applies language strings and fetches
+ *     stadium metadata from the backend to populate the location/intent dropdowns.
+ *   - Form submission calls `onSubmit()`, which POSTs to `/api/assist` and
+ *     passes the JSON response to `renderResult()`.
+ *   - All API calls are prefixed with `API_BASE_URL` which resolves to the
+ *     Render backend URL in production or an empty string when running locally.
+ *
+ * @module app
+ */
+
+/**
+ * Base URL for all API requests.
+ * Resolves to an empty string (relative paths) when running on localhost or
+ * 127.0.0.1, so that the local uvicorn server is hit directly. In any other
+ * environment (Vercel, CI preview) it points to the Render backend.
+ *
+ * @constant {string}
+ */
+const API_BASE_URL =
+  window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
+    ? ""
+    : "https://arenaiq-e22w.onrender.com";
 
 // ---------------------------------------------------------------------------
-// Localization (EN/ES/FR). UI chrome uses [data-i18n]; dynamic strings use STR[].
+// Localization tables (EN / ES / FR)
+// UI chrome elements use [data-i18n] attributes; dynamic strings use STR[].
 // ---------------------------------------------------------------------------
+
+/**
+ * Static UI string table for all three supported languages.
+ * Keys match the `data-i18n` attribute values used in `index.html`.
+ *
+ * @type {Object.<string, Object.<string, string>>}
+ */
 const I18N = {
   en: {
     language: "Language",
@@ -71,6 +106,12 @@ const I18N = {
   },
 };
 
+/**
+ * Localized display labels for each destination intent value.
+ * Populated into the `destination_intent` dropdown by `refreshIntentOptions`.
+ *
+ * @type {Object.<string, Object.<string, string>>}
+ */
 const INTENT_LABELS = {
   en: {
     restroom: "🚻 Restroom", gate: "🚪 Entry gate", seat: "💺 My seat", exit: "🚶 Exit",
@@ -89,6 +130,11 @@ const INTENT_LABELS = {
   },
 };
 
+/**
+ * Localized dynamic strings used in result rendering (crowd labels, error messages, etc.).
+ *
+ * @type {Object.<string, Object.<string, string>>}
+ */
 const STR = {
   en: {
     crowd: "Crowd", accessible: "Step-free / accessible", route: "Route", mode: "Mode",
@@ -125,47 +171,92 @@ const STR = {
   },
 };
 
-// Shape-based crowd dots (never rely on colour alone — accessibility)
+/**
+ * Shape-based crowd dot indicators (never rely on colour alone — accessibility).
+ * Used alongside colour-coded badges so colour-blind users can distinguish levels.
+ *
+ * @type {Object.<string, string>}
+ */
 const DOTS = { low: "●○○", medium: "●●○", high: "●●●" };
 
-// Crowd emojis for the panel
+/**
+ * Emoji indicators for crowd level used in the crowd panel display.
+ *
+ * @type {Object.<string, string>}
+ */
 const CROWD_EMOJI = { low: "🟢", medium: "🟡", high: "🔴" };
 
 // ---------------------------------------------------------------------------
-// State + helpers
+// State
 // ---------------------------------------------------------------------------
+
+/** @type {string} Currently selected language code ('en', 'es', or 'fr'). */
 let currentLang = "en";
+
+/**
+ * Shorthand helper to retrieve a DOM element by ID.
+ *
+ * @param {string} id - The element's `id` attribute value.
+ * @returns {HTMLElement|null} The matching element, or null if not found.
+ */
 const $ = (id) => document.getElementById(id);
 
+/**
+ * Retrieve the localized string table for the current language, with English fallback.
+ *
+ * @template T
+ * @param {Object.<string, T>} dict - A language-keyed object to look up.
+ * @returns {T} The entry for the current language, or the English entry as fallback.
+ */
 function t(dict) {
   return dict[currentLang] || dict.en;
 }
 
 // ---------------------------------------------------------------------------
-// Bootstrapping
+// Bootstrap
 // ---------------------------------------------------------------------------
+
+/**
+ * Application entry point — called once when the DOM is fully loaded.
+ *
+ * Applies the default language (English) to all `data-i18n` elements,
+ * binds all interactive event listeners, and fetches stadium metadata
+ * from the backend to populate the location and destination dropdowns.
+ *
+ * @async
+ * @returns {Promise<void>} Resolves when stadium data has been fetched and
+ *   the dropdowns have been populated (or an error state has been shown).
+ */
 async function init() {
   applyLanguage("en");
   bindEvents();
   await loadStadium();
 }
 
+/**
+ * Bind all interactive event listeners to their respective DOM elements.
+ *
+ * Handles: language selector change, high-contrast toggle, form submission,
+ * textarea character counter, and the +/− minute stepper buttons.
+ *
+ * @returns {void}
+ */
 function bindEvents() {
   $("language").addEventListener("change", (e) => applyLanguage(e.target.value));
   $("contrast-toggle").addEventListener("click", toggleContrast);
   $("assist-form").addEventListener("submit", onSubmit);
 
-  // Character counter for question textarea
+  // Update the character counter below the textarea on each keystroke.
   const q = $("question");
   const counter = $("char-count");
   if (q && counter) {
     q.addEventListener("input", () => { counter.textContent = q.value.length; });
   }
 
-  // +/- buttons for minutes_to_kickoff
+  // Wire up the +/− stepper buttons for the minutes-to-kickoff field.
   const mInput = $("minutes_to_kickoff");
   const btnMinus = $("minutes-minus");
-  const btnPlus  = $("minutes-plus");
+  const btnPlus = $("minutes-plus");
   if (mInput && btnMinus && btnPlus) {
     btnMinus.addEventListener("click", () => {
       const val = parseInt(mInput.value, 10);
@@ -182,17 +273,29 @@ function bindEvents() {
   }
 }
 
+/**
+ * Fetch stadium metadata from the backend and populate the UI dropdowns.
+ *
+ * Makes a GET request to `{API_BASE_URL}/api/stadium`. On success, stores
+ * the response on `window.__stadium` for re-use during language switching,
+ * then calls `renderLocationOptions` and `refreshIntentOptions` to populate
+ * the two `<select>` elements. Updates the stadium name badge in the header.
+ *
+ * @async
+ * @returns {Promise<void>} Resolves when the dropdowns are populated.
+ * @throws {Error} Caught internally; shows an error message in the result
+ *   panel and clears the stadium badge if the request fails.
+ */
 async function loadStadium() {
   try {
     const res = await fetch(API_BASE_URL + "/api/stadium");
     if (!res.ok) throw new Error("stadium metadata unavailable");
     const data = await res.json();
-    window.__stadium = data;   // keep zone/facility maps for re-localization
+    window.__stadium = data;    // cache for re-localization on language change
     window.__intents = data.intents;
     renderLocationOptions();
     refreshIntentOptions(data.intents);
     const s = data.stadium;
-    // Update both header stadium-meta badge and footer
     const metaEl = $("stadium-meta");
     if (metaEl) metaEl.textContent = `${s.name}`;
   } catch (err) {
@@ -202,6 +305,18 @@ async function loadStadium() {
   }
 }
 
+/**
+ * Populate a `<select>` element with option elements from a list of value/label pairs.
+ *
+ * Clears all existing options before inserting the new ones so this function
+ * is safe to call repeatedly during language switches.
+ *
+ * @param {HTMLSelectElement} select - The `<select>` element to populate.
+ * @param {Array.<[string, string]>} pairs - Array of `[value, label]` tuples
+ *   where `value` is the option's `value` attribute and `label` is the
+ *   visible text content.
+ * @returns {void}
+ */
 function populateSelect(select, pairs) {
   select.innerHTML = "";
   for (const [value, label] of pairs) {
@@ -212,6 +327,16 @@ function populateSelect(select, pairs) {
   }
 }
 
+/**
+ * Re-render the destination intent `<select>` options for the current language.
+ *
+ * Preserves the user's previously selected value after re-populating so that
+ * switching languages does not reset the selection.
+ *
+ * @param {string[]} intents - Array of intent key strings as returned by
+ *   the `/api/stadium` endpoint (e.g. `["restroom", "gate", "seat", ...]`).
+ * @returns {void}
+ */
 function refreshIntentOptions(intents) {
   const labels = INTENT_LABELS[currentLang] || INTENT_LABELS.en;
   const select = $("destination_intent");
@@ -220,6 +345,14 @@ function refreshIntentOptions(intents) {
   if (previous) select.value = previous;
 }
 
+/**
+ * Re-render the current location `<select>` options for the current language.
+ *
+ * Uses the cached `window.__stadium.zones` array (set by `loadStadium`).
+ * Preserves the user's previously selected value after re-populating.
+ *
+ * @returns {void}
+ */
 function renderLocationOptions() {
   const data = window.__stadium;
   if (!data) return;
@@ -233,8 +366,21 @@ function renderLocationOptions() {
 }
 
 // ---------------------------------------------------------------------------
-// Language + theme
+// Language + accessibility theme
 // ---------------------------------------------------------------------------
+
+/**
+ * Switch the UI to the specified language and re-render all dynamic content.
+ *
+ * Updates the `lang` attribute on `<html>` for screen-reader compatibility,
+ * replaces all `[data-i18n]` element text content with the new language
+ * strings, and re-renders the location and intent dropdowns with localized
+ * option labels.
+ *
+ * @param {string} lang - ISO 639-1 language code to switch to
+ *   (`'en'`, `'es'`, or `'fr'`). Falls back to `'en'` for unknown codes.
+ * @returns {void}
+ */
 function applyLanguage(lang) {
   currentLang = lang in I18N ? lang : "en";
   document.documentElement.lang = currentLang;  // update <html lang> for a11y
@@ -248,19 +394,41 @@ function applyLanguage(lang) {
   renderLocationOptions();
 }
 
+/**
+ * Toggle the high-contrast accessibility theme on the `<body>` element.
+ *
+ * Flips the `aria-pressed` state on the toggle button and adds/removes the
+ * `hi-vis` CSS class from `<body>`. Also synchronizes the `visual`
+ * accessibility checkbox to match the high-contrast state, so the backend
+ * receives the correct accessibility mode when the form is submitted.
+ *
+ * @returns {void}
+ */
 function toggleContrast() {
   const btn = $("contrast-toggle");
   const on = btn.getAttribute("aria-pressed") !== "true";
   btn.setAttribute("aria-pressed", String(on));
   document.body.classList.toggle("hi-vis", on);
-  // High-visibility mode maps to the visual accessibility path server-side.
+  // Mirror the visual accessibility checkbox so the backend sees the correct mode.
   const visual = document.querySelector('input[name="need"][value="visual"]');
   if (visual) visual.checked = on;
 }
 
 // ---------------------------------------------------------------------------
-// Submit state helpers
+// Submit state management
 // ---------------------------------------------------------------------------
+
+/**
+ * Set or clear the loading state on the submit button.
+ *
+ * Disables the button, hides the icon, and shows the spinner animation
+ * during an in-flight API request. Restores all elements to their resting
+ * state when `isLoading` is `false`.
+ *
+ * @param {boolean} isLoading - `true` to enter the loading state; `false`
+ *   to restore the button to its default interactive state.
+ * @returns {void}
+ */
 function setLoading(isLoading) {
   const btn     = $("submit-btn");
   const icon    = $("btn-icon");
@@ -288,6 +456,24 @@ function setLoading(isLoading) {
 // ---------------------------------------------------------------------------
 // Data collection
 // ---------------------------------------------------------------------------
+
+/**
+ * Collect all current form field values into the request payload object.
+ *
+ * Reads the current location, destination intent, checked accessibility
+ * needs, ticket section, minutes to kickoff, and optional question from
+ * the form DOM elements. Omits optional fields when empty.
+ *
+ * @returns {{
+ *   language: string,
+ *   current_location: string,
+ *   destination_intent: string,
+ *   accessibility_needs: string[],
+ *   minutes_to_kickoff: number,
+ *   ticket_section?: string,
+ *   question?: string
+ * }} The JSON-serializable payload ready to POST to `/api/assist`.
+ */
 function collectContext() {
   const needs = Array.from(document.querySelectorAll('input[name="need"]:checked')).map(
     (el) => el.value
@@ -307,14 +493,28 @@ function collectContext() {
 }
 
 // ---------------------------------------------------------------------------
-// Submit handler
+// Form submission
 // ---------------------------------------------------------------------------
+
+/**
+ * Handle form submission: POST the context to the backend and render the result.
+ *
+ * Prevents the default browser form submission, sets the ARIA busy state and
+ * loading UI, then POSTs the collected context to `{API_BASE_URL}/api/assist`.
+ * Handles HTTP 422 (invalid input), 429 (rate limited), and other error
+ * statuses with localized error messages. On success, passes the response
+ * JSON to `renderResult`.
+ *
+ * @async
+ * @param {SubmitEvent} event - The form submit event to prevent default on.
+ * @returns {Promise<void>} Resolves when the result or error has been rendered.
+ */
 async function onSubmit(event) {
   event.preventDefault();
   const result = $("result");
   result.setAttribute("aria-busy", "true");
   setLoading(true);
-  // Hide empty state on first submit
+  // Hide the empty-state placeholder on first submission.
   const emptyState = $("empty-state");
   if (emptyState) emptyState.hidden = true;
 
@@ -339,33 +539,57 @@ async function onSubmit(event) {
 // ---------------------------------------------------------------------------
 // Result rendering
 // ---------------------------------------------------------------------------
+
+/**
+ * Render the full API response into the result panel.
+ *
+ * Builds and inserts DOM elements for: the AI answer paragraph, facility and
+ * crowd metadata badges, the crowd level panel with pulsing dot indicator,
+ * urgency and alternatives notices, and the numbered route steps list.
+ * All elements are appended to a container with a CSS entry animation.
+ *
+ * @param {{
+ *   answer: string,
+ *   facility: {name: string, accessible: boolean},
+ *   crowd_level: 'low'|'medium'|'high',
+ *   accessibility_mode: string,
+ *   urgency: string|null,
+ *   alternatives_note: string|null,
+ *   route_steps: Array.<{
+ *     order: number,
+ *     means: string,
+ *     step_free: boolean,
+ *     instruction: string
+ *   }>
+ * }} data - The deserialized JSON response from `POST /api/assist`.
+ * @returns {void}
+ */
 function renderResult(data) {
   const s = STR[currentLang] || STR.en;
   const result = $("result");
   result.innerHTML = "";
 
-  // Wrap everything in an animated container
+  // Animated wrapper for the entry fade-up transition.
   const wrap = document.createElement("div");
   wrap.className = "result-enter";
   result.appendChild(wrap);
 
-  // --- AI answer text ---
+  // AI answer paragraph.
   const answer = document.createElement("p");
   answer.className = "answer";
   answer.textContent = data.answer;
   wrap.appendChild(answer);
 
-  // --- Facility + crowd + accessibility badges ---
+  // Facility + crowd + accessibility metadata badges.
   const grid = document.createElement("div");
   grid.className = "meta-grid";
 
-  // Facility name badge
   const facilityBadge = document.createElement("span");
   facilityBadge.className = "badge";
   facilityBadge.textContent = data.facility.name;
   grid.appendChild(facilityBadge);
 
-  // Crowd badge with shape indicator
+  // Crowd badge uses both colour class and shape dots for colour-blind accessibility.
   const crowdBadge = document.createElement("span");
   crowdBadge.className = `badge crowd-${data.crowd_level}`;
   const dots = document.createElement("span");
@@ -378,7 +602,6 @@ function renderResult(data) {
   crowdBadge.appendChild(crowdText);
   grid.appendChild(crowdBadge);
 
-  // Accessibility badge
   if (data.facility.accessible) {
     const accBadge = document.createElement("span");
     accBadge.className = "badge";
@@ -389,7 +612,6 @@ function renderResult(data) {
     grid.appendChild(accBadge);
   }
 
-  // Mode badge
   const modeBadge = document.createElement("span");
   modeBadge.className = "badge";
   modeBadge.textContent = `${s.mode}: ${s[data.accessibility_mode] || data.accessibility_mode}`;
@@ -397,7 +619,7 @@ function renderResult(data) {
 
   wrap.appendChild(grid);
 
-  // --- Crowd level panel ---
+  // Crowd level panel with animated dot indicator.
   const crowdPanel = document.createElement("div");
   crowdPanel.className = `crowd-panel ${data.crowd_level}`;
   const crowdDot = document.createElement("span");
@@ -415,13 +637,10 @@ function renderResult(data) {
   crowdPanel.appendChild(crowdDotsText);
   wrap.appendChild(crowdPanel);
 
-  // --- Urgency banner ---
   if (data.urgency) wrap.appendChild(notice("⚡ " + data.urgency, true));
-
-  // --- Alternatives note ---
   if (data.alternatives_note) wrap.appendChild(notice("ℹ️ " + data.alternatives_note, false));
 
-  // --- Route steps ---
+  // Route steps list with staggered entry animation.
   if (data.route_steps && data.route_steps.length) {
     const heading = document.createElement("p");
     heading.className = "route-heading";
@@ -433,7 +652,7 @@ function renderResult(data) {
 
     data.route_steps.forEach((step, idx) => {
       const li = document.createElement("li");
-      // Stagger animation
+      // Stagger each step's entry animation by 80 ms per step.
       li.style.animationDelay = `${idx * 80}ms`;
 
       const numEl = document.createElement("span");
@@ -459,10 +678,7 @@ function renderResult(data) {
 
       const meansEl = document.createElement("span");
       meansEl.className = "step-means";
-      // Map means to emoji
-      const meansEmoji = {
-        walk: "🚶", ramp: "♿", elevator: "🛗", stairs: "🪜"
-      };
+      const meansEmoji = { walk: "🚶", ramp: "♿", elevator: "🛗", stairs: "🪜" };
       meansEl.textContent = (meansEmoji[step.means] || "➡️") + " " + step.means;
       meta.appendChild(meansEl);
 
@@ -483,8 +699,20 @@ function renderResult(data) {
 }
 
 // ---------------------------------------------------------------------------
-// Notice (urgency / alternatives)
+// Notice helper
 // ---------------------------------------------------------------------------
+
+/**
+ * Create a styled notice element for urgency or alternatives information.
+ *
+ * Returns a `<div>` with the appropriate CSS class for either an urgent
+ * banner (yellow, bold) or an informational note (blue, normal weight).
+ *
+ * @param {string} text - The localized message text to display.
+ * @param {boolean} urgent - If `true`, applies the `urgent` CSS class for
+ *   the high-visibility warning style; otherwise uses the default info style.
+ * @returns {HTMLDivElement} The configured notice `<div>` element.
+ */
 function notice(text, urgent) {
   const div = document.createElement("div");
   div.className = "notice" + (urgent ? " urgent" : "");
@@ -495,6 +723,17 @@ function notice(text, urgent) {
 // ---------------------------------------------------------------------------
 // Error display
 // ---------------------------------------------------------------------------
+
+/**
+ * Render a localized error message in the result panel.
+ *
+ * Clears any previous result content and inserts a single `<p>` element
+ * with `role="alert"` so screen readers announce the error immediately.
+ *
+ * @param {string} message - The localized error string to display. A ⚠️
+ *   emoji is prepended automatically.
+ * @returns {void}
+ */
 function renderError(message) {
   const result = $("result");
   result.innerHTML = "";
