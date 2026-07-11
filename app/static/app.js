@@ -1,6 +1,8 @@
 "use strict";
 
-const API_BASE_URL = "https://arenaiq-e22w.onrender.com";
+const API_BASE_URL = (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
+  ? ""
+  : "https://arenaiq-e22w.onrender.com";
 
 // ---------------------------------------------------------------------------
 // Localization (EN/ES/FR). UI chrome uses [data-i18n]; dynamic strings use STR[].
