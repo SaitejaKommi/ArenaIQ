@@ -1,0 +1,21 @@
+# Keep the build context (and image) lean — runtime needs only app/ + requirements.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+.git/
+.gitignore
+tests/
+pytest.ini
+pyproject.toml
+README.md
+LICENSE
+.env
+.env.*
+!.env.example
