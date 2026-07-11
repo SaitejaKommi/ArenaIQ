@@ -8,8 +8,16 @@
   ],
   "routes": [
     {
-      "src": "/(.*)",
+      "src": "^/static/(.*)",
       "dest": "app/static/$1"
+    },
+    {
+      "src": "^/(.*\\.(css|js|png|jpg|svg|ico|json))",
+      "dest": "app/static/$1"
+    },
+    {
+      "src": "^/(.*)$",
+      "dest": "app/static/index.html"
     }
   ]
 }
