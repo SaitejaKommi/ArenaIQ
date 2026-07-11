@@ -45,6 +45,8 @@ def _install_fake_genai(monkeypatch, generate):
 
     fake.configure = lambda **kwargs: None
     fake.GenerativeModel = GenerativeModel
+    import google
+    monkeypatch.setattr(google, "generativeai", fake, raising=False)
     monkeypatch.setitem(sys.modules, "google.generativeai", fake)
 
 
@@ -102,8 +104,9 @@ def test_factory_falls_back_when_client_init_fails(monkeypatch):
         raise RuntimeError("bad credentials")
 
     fake.configure = boom
-    fake.GenerativeModel = lambda name: None
     monkeypatch.setitem(sys.modules, "google.generativeai", fake)
+    import google
+    monkeypatch.setattr(google, "generativeai", fake, raising=False)
     # Key is present but the SDK blows up → graceful fallback to MockLLM.
     client = get_llm_client(Settings(gemini_api_key="fake-key"))
     assert isinstance(client, MockLLM)

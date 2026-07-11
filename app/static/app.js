@@ -1,5 +1,7 @@
 "use strict";
 
+const API_BASE_URL = "RENDER_BACKEND_URL_HERE";
+
 // ---------------------------------------------------------------------------
 // Localization (EN/ES/FR). UI chrome uses [data-i18n]; dynamic strings use STR[].
 // ---------------------------------------------------------------------------
@@ -180,7 +182,7 @@ function bindEvents() {
 
 async function loadStadium() {
   try {
-    const res = await fetch("/api/stadium");
+    const res = await fetch(API_BASE_URL + "/api/stadium");
     if (!res.ok) throw new Error("stadium metadata unavailable");
     const data = await res.json();
     window.__stadium = data;   // keep zone/facility maps for re-localization
@@ -315,7 +317,7 @@ async function onSubmit(event) {
   if (emptyState) emptyState.hidden = true;
 
   try {
-    const res = await fetch("/api/assist", {
+    const res = await fetch(API_BASE_URL + "/api/assist", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(collectContext()),

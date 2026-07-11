@@ -35,9 +35,13 @@ class Settings(BaseSettings):
     gemini_model: str = Field(default="gemini-1.5-flash")
     gemini_max_output_tokens: int = Field(default=256, ge=16, le=2048)
 
-    # --- HTTP security ---
     allowed_origins: list[str] = Field(
-        default=["http://localhost:8000", "http://127.0.0.1:8000"],
+        default=[
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+            "http://localhost:3000",
+            "http://localhost:5501",
+        ],
         description="Explicit CORS allow-list. Same-origin localhost by default.",
     )
 
