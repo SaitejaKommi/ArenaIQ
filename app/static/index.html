@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>StadiumMate — AI Stadium Assistant | FIFA World Cup 2026</title>
-  <meta name="description" content="StadiumMate: AI-powered stadium navigation, crowd management, and accessibility assistant for FIFA World Cup 2026 at MetLife Stadium." />
+  <title>ArenaIQ — AI Stadium Assistant | FIFA World Cup 2026</title>
+  <meta name="description" content="ArenaIQ: AI-powered stadium navigation, crowd management, and accessibility assistant for FIFA World Cup 2026 at MetLife Stadium." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet" />
@@ -16,7 +16,7 @@
   <a class="skip-link" href="#main">Skip to main content</a>
 
   <!-- ================================================================ -->
-  <!-- STICKY HEADER -->
+  <!-- STICKY HEADER                                                     -->
   <!-- ================================================================ -->
   <header class="site-header" role="banner">
     <div class="header-inner">
@@ -25,7 +25,7 @@
       <div class="brand">
         <span class="brand-icon" aria-hidden="true">⚽</span>
         <div class="brand-text">
-          <span class="brand-name">StadiumMate</span>
+          <span class="brand-name">ArenaIQ</span>
           <span class="brand-sub">FIFA World Cup 2026</span>
         </div>
       </div>
@@ -34,8 +34,8 @@
       <nav class="header-controls" aria-label="Display settings">
 
         <!-- Stadium badge -->
-        <div class="stadium-badge" aria-hidden="true">
-          <span>🏟️</span>
+        <div class="stadium-badge" aria-label="Current stadium">
+          <span aria-hidden="true">🏟️</span>
           <span id="stadium-meta">MetLife Stadium</span>
         </div>
 
@@ -43,7 +43,7 @@
         <label class="sr-only" for="language">
           <span data-i18n="language">Language</span>
         </label>
-        <div class="select-wrapper">
+        <div class="select-wrapper header-select">
           <select id="language" name="language" aria-label="Select language">
             <option value="en">🌐 English</option>
             <option value="es">🌐 Español</option>
@@ -69,26 +69,34 @@
   </header>
 
   <!-- ================================================================ -->
-  <!-- HERO SECTION -->
+  <!-- HERO SECTION                                                      -->
   <!-- ================================================================ -->
-  <section class="hero" aria-label="StadiumMate introduction">
+  <section class="hero" aria-label="ArenaIQ introduction">
     <div class="hero-inner">
-      <h1 class="hero-title">Your Smart Stadium Guide</h1>
-      <p class="hero-subtitle">
-        AI-powered navigation, crowd management, and accessibility
-        for FIFA World Cup 2026
-      </p>
-      <div class="hero-badges" aria-label="Key features">
-        <span class="hero-badge">🏟️ MetLife Stadium</span>
-        <span class="hero-badge">🌍 3 Languages</span>
-        <span class="hero-badge">♿ Fully Accessible</span>
-        <span class="hero-badge">⚡ Real-time Crowds</span>
+      <div class="hero-content">
+        <div class="hero-eyebrow">FIFA World Cup 2026 Official Assistant</div>
+        <h1 class="hero-title">Your Smart<br>Stadium Guide</h1>
+        <p class="hero-subtitle">
+          AI-powered navigation, crowd management, and accessibility
+          for FIFA World Cup 2026 at MetLife Stadium
+        </p>
+        <div class="hero-badges" aria-label="Key features">
+          <span class="hero-badge">🏟️ MetLife Stadium</span>
+          <span class="hero-badge">🌍 3 Languages</span>
+          <span class="hero-badge">♿ Fully Accessible</span>
+          <span class="hero-badge">⚡ Real-time Crowds</span>
+        </div>
+      </div>
+      <div class="hero-visual" aria-hidden="true">
+        <div class="hero-orb">
+          <span class="hero-emoji">⚽</span>
+        </div>
       </div>
     </div>
   </section>
 
   <!-- ================================================================ -->
-  <!-- MAIN TWO-COLUMN LAYOUT -->
+  <!-- MAIN TWO-COLUMN LAYOUT                                            -->
   <!-- ================================================================ -->
   <main id="main" class="main-layout">
 
@@ -211,6 +219,7 @@
               rows="3"
               maxlength="280"
               placeholder="e.g. Where is the nearest step-free restroom?"
+              aria-describedby="question-hint"
             ></textarea>
             <div class="char-counter"><span id="char-count">0</span>/280</div>
           </div>
@@ -267,16 +276,18 @@
   </main>
 
   <!-- ================================================================ -->
-  <!-- FOOTER -->
+  <!-- FOOTER                                                            -->
   <!-- ================================================================ -->
   <footer class="site-footer" role="contentinfo">
-    <p class="footer-text">
-      <strong>StadiumMate</strong> — FIFA World Cup 2026 &nbsp;|&nbsp;
-      Powered by Google Gemini AI
-    </p>
-    <p class="footer-sub" data-i18n="grounding">
-      Answers are grounded in verified stadium data — the assistant never invents facilities.
-    </p>
+    <div class="footer-inner">
+      <p class="footer-text">
+        <strong>ArenaIQ</strong> — FIFA World Cup 2026 &nbsp;|&nbsp;
+        Powered by Google Gemini AI
+      </p>
+      <p class="footer-sub" data-i18n="grounding">
+        Answers are grounded in verified stadium data — the assistant never invents facilities.
+      </p>
+    </div>
   </footer>
 
   <script src="/static/app.js"></script>
