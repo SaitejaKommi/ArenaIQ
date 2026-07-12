@@ -186,6 +186,30 @@ const DOTS = { low: "●○○", medium: "●●○", high: "●●●" };
  */
 const CROWD_EMOJI = { low: "🟢", medium: "🟡", high: "🔴" };
 
+/**
+ * Emoji map for each transit means used in route step rendering.
+ * Avoids hard-coding the same literals inside the forEach loop.
+ *
+ * @type {Object.<string, string>}
+ */
+const MEANS_EMOJI = { walk: "🚶", ramp: "♿", elevator: "🛗", stairs: "🪜" };
+
+/**
+ * Stagger delay in milliseconds added per route step entry animation.
+ * Each step's CSS animation is delayed by its index times this value.
+ *
+ * @type {number}
+ */
+const STEP_ANIMATION_DELAY_MS = 80;
+
+/**
+ * Border colour for the step-free/accessible facility badge.
+ * Defined as a constant to avoid a bare hex literal inside renderResult.
+ *
+ * @type {string}
+ */
+const COLOR_ACCESSIBLE_BORDER = "#A7F3D0";
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -198,6 +222,10 @@ let currentLang = "en";
  *
  * @param {string} id - The element's `id` attribute value.
  * @returns {HTMLElement|null} The matching element, or null if not found.
+ *
+ * @example
+ * const btn = $("submit-btn");
+ * if (btn) btn.disabled = true;
  */
 const $ = (id) => document.getElementById(id);
 
@@ -207,6 +235,10 @@ const $ = (id) => document.getElementById(id);
  * @template T
  * @param {Object.<string, T>} dict - A language-keyed object to look up.
  * @returns {T} The entry for the current language, or the English entry as fallback.
+ * @throws {void} Does not throw; returns English fallback for unknown language codes.
+ *
+ * @example
+ * const crowdText = t(STR).crowd; // Returns "Afluencia" if currentLang is "es"
  */
 function t(dict) {
   return dict[currentLang] || dict.en;
@@ -226,6 +258,10 @@ function t(dict) {
  * @async
  * @returns {Promise<void>} Resolves when stadium data has been fetched and
  *   the dropdowns have been populated (or an error state has been shown).
+ *
+ * @example
+ * // Triggered automatically on DOM load:
+ * document.addEventListener("DOMContentLoaded", init);
  */
 async function init() {
   applyLanguage("en");
@@ -240,6 +276,10 @@ async function init() {
  * textarea character counter, and the +/− minute stepper buttons.
  *
  * @returns {void}
+ *
+ * @example
+ * // Called during initialization:
+ * bindEvents();
  */
 function bindEvents() {
   $("language").addEventListener("change", (e) => applyLanguage(e.target.value));
@@ -285,6 +325,10 @@ function bindEvents() {
  * @returns {Promise<void>} Resolves when the dropdowns are populated.
  * @throws {Error} Caught internally; shows an error message in the result
  *   panel and clears the stadium badge if the request fails.
+ *
+ * @example
+ * // Called during init to fetch static metadata:
+ * await loadStadium();
  */
 async function loadStadium() {
   try {
@@ -312,10 +356,15 @@ async function loadStadium() {
  * is safe to call repeatedly during language switches.
  *
  * @param {HTMLSelectElement} select - The `<select>` element to populate.
- * @param {Array.<[string, string]>} pairs - Array of `[value, label]` tuples
+ * @param {Array.<{value: string, label: string}>} pairs - Array of `{value, label}` objects
  *   where `value` is the option's `value` attribute and `label` is the
  *   visible text content.
  * @returns {void}
+ * @throws {void} Does not throw.
+ *
+ * @example
+ * const select = $("destination_intent");
+ * populateSelect(select, [{value: "restroom", label: "Restroom"}, {value: "gate", label: "Entry Gate"}]);
  */
 function populateSelect(select, pairs) {
   select.innerHTML = "";
@@ -336,6 +385,9 @@ function populateSelect(select, pairs) {
  * @param {string[]} intents - Array of intent key strings as returned by
  *   the `/api/stadium` endpoint (e.g. `["restroom", "gate", "seat", ...]`).
  * @returns {void}
+ *
+ * @example
+ * refreshIntentOptions(["restroom", "gate", "seat"]);
  */
 function refreshIntentOptions(intents) {
   const labels = INTENT_LABELS[currentLang] || INTENT_LABELS.en;
@@ -352,6 +404,9 @@ function refreshIntentOptions(intents) {
  * Preserves the user's previously selected value after re-populating.
  *
  * @returns {void}
+ *
+ * @example
+ * renderLocationOptions();
  */
 function renderLocationOptions() {
   const data = window.__stadium;
@@ -380,6 +435,9 @@ function renderLocationOptions() {
  * @param {string} lang - ISO 639-1 language code to switch to
  *   (`'en'`, `'es'`, or `'fr'`). Falls back to `'en'` for unknown codes.
  * @returns {void}
+ *
+ * @example
+ * applyLanguage("es"); // Switches the entire UI to Spanish
  */
 function applyLanguage(lang) {
   currentLang = lang in I18N ? lang : "en";
@@ -403,6 +461,10 @@ function applyLanguage(lang) {
  * receives the correct accessibility mode when the form is submitted.
  *
  * @returns {void}
+ *
+ * @example
+ * // Bound to the contrast toggle button click event:
+ * toggleContrast();
  */
 function toggleContrast() {
   const btn = $("contrast-toggle");
@@ -428,6 +490,11 @@ function toggleContrast() {
  * @param {boolean} isLoading - `true` to enter the loading state; `false`
  *   to restore the button to its default interactive state.
  * @returns {void}
+ *
+ * @example
+ * setLoading(true); // Spinners active, button disabled
+ * await fetch("/api/assist", ...);
+ * setLoading(false); // Restored
  */
 function setLoading(isLoading) {
   const btn     = $("submit-btn");
@@ -473,6 +540,11 @@ function setLoading(isLoading) {
  *   ticket_section?: string,
  *   question?: string
  * }} The JSON-serializable payload ready to POST to `/api/assist`.
+ * @throws {void} Does not throw.
+ *
+ * @example
+ * const payload = collectContext();
+ * console.log(payload.language); // "en"
  */
 function collectContext() {
   const needs = Array.from(document.querySelectorAll('input[name="need"]:checked')).map(
@@ -508,6 +580,10 @@ function collectContext() {
  * @async
  * @param {SubmitEvent} event - The form submit event to prevent default on.
  * @returns {Promise<void>} Resolves when the result or error has been rendered.
+ *
+ * @example
+ * // Bound to the form submit event:
+ * form.addEventListener("submit", onSubmit);
  */
 async function onSubmit(event) {
   event.preventDefault();
@@ -563,24 +639,28 @@ async function onSubmit(event) {
  *   }>
  * }} data - The deserialized JSON response from `POST /api/assist`.
  * @returns {void}
+ *
+/**
+ * Build and return the facility, crowd, and accessibility metadata badge grid.
+ *
+ * Creates a `<div class="meta-grid">` containing three or four badge elements:
+ * facility name, crowd level (with shape dots for colour-blind users), an
+ * optional step-free badge, and the accessibility mode badge.
+ *
+ * @param {{
+ *   facility: {name: string, accessible: boolean},
+ *   crowd_level: 'low'|'medium'|'high',
+ *   accessibility_mode: string
+ * }} data - Subset of the API response used by this helper.
+ * @param {Object.<string, string>} s - Localized string table for the current language.
+ * @returns {HTMLDivElement} The populated `<div class="meta-grid">` element.
+ * @throws {void} Does not throw.
+ *
+ * @example
+ * const grid = _buildMetaBadges(data, t(STR));
+ * wrap.appendChild(grid);
  */
-function renderResult(data) {
-  const s = STR[currentLang] || STR.en;
-  const result = $("result");
-  result.innerHTML = "";
-
-  // Animated wrapper for the entry fade-up transition.
-  const wrap = document.createElement("div");
-  wrap.className = "result-enter";
-  result.appendChild(wrap);
-
-  // AI answer paragraph.
-  const answer = document.createElement("p");
-  answer.className = "answer";
-  answer.textContent = data.answer;
-  wrap.appendChild(answer);
-
-  // Facility + crowd + accessibility metadata badges.
+function _buildMetaBadges(data, s) {
   const grid = document.createElement("div");
   grid.className = "meta-grid";
 
@@ -589,7 +669,6 @@ function renderResult(data) {
   facilityBadge.textContent = data.facility.name;
   grid.appendChild(facilityBadge);
 
-  // Crowd badge uses both colour class and shape dots for colour-blind accessibility.
   const crowdBadge = document.createElement("span");
   crowdBadge.className = `badge crowd-${data.crowd_level}`;
   const dots = document.createElement("span");
@@ -607,7 +686,7 @@ function renderResult(data) {
     accBadge.className = "badge";
     accBadge.style.color = "var(--crowd-low)";
     accBadge.style.background = "var(--crowd-low-bg)";
-    accBadge.style.borderColor = "#A7F3D0";
+    accBadge.style.borderColor = COLOR_ACCESSIBLE_BORDER;
     accBadge.textContent = "♿ " + s.accessible;
     grid.appendChild(accBadge);
   }
@@ -617,85 +696,179 @@ function renderResult(data) {
   modeBadge.textContent = `${s.mode}: ${s[data.accessibility_mode] || data.accessibility_mode}`;
   grid.appendChild(modeBadge);
 
-  wrap.appendChild(grid);
+  return grid;
+}
 
-  // Crowd level panel with animated dot indicator.
+/**
+ * Build and return the animated crowd-level status panel.
+ *
+ * Creates a `<div class="crowd-panel {level}">` containing a pulsing dot
+ * indicator, a label, and shape-based dot text for colour-blind accessibility.
+ *
+ * @param {{
+ *   crowd_level: 'low'|'medium'|'high'
+ * }} data - Subset of the API response containing the crowd level.
+ * @param {Object.<string, string>} s - Localized string table for the current language.
+ * @returns {HTMLDivElement} The populated crowd panel `<div>` element.
+ * @throws {void} Does not throw.
+ *
+ * @example
+ * const panel = _buildCrowdPanel(data, t(STR));
+ * wrap.appendChild(panel);
+ */
+function _buildCrowdPanel(data, s) {
   const crowdPanel = document.createElement("div");
   crowdPanel.className = `crowd-panel ${data.crowd_level}`;
+
   const crowdDot = document.createElement("span");
   crowdDot.className = "crowd-dot";
   crowdDot.setAttribute("aria-hidden", "true");
   crowdPanel.appendChild(crowdDot);
+
   const crowdLabelEl = document.createElement("span");
   crowdLabelEl.className = "crowd-label";
   crowdLabelEl.textContent = `${s.crowdAt}: ${s[data.crowd_level]}`;
   crowdPanel.appendChild(crowdLabelEl);
+
   const crowdDotsText = document.createElement("span");
   crowdDotsText.className = "crowd-dots-text";
   crowdDotsText.setAttribute("aria-hidden", "true");
   crowdDotsText.textContent = DOTS[data.crowd_level] || "";
   crowdPanel.appendChild(crowdDotsText);
-  wrap.appendChild(crowdPanel);
+
+  return crowdPanel;
+}
+
+/**
+ * Build and return the numbered route steps ordered list with staggered animations.
+ *
+ * Creates an `<ol class="route-steps">` element with one `<li>` per step.
+ * Each list item contains the step number, instruction text, transit means
+ * emoji, and an optional step-free badge. Returns null if there are no steps.
+ *
+ * @param {{
+ *   route_steps: Array.<{
+ *     order: number,
+ *     means: string,
+ *     step_free: boolean,
+ *     instruction: string
+ *   }>
+ * }} data - Subset of the API response containing the route steps array.
+ * @param {Object.<string, string>} s - Localized string table for the current language.
+ * @returns {HTMLElement|null} A `<div>` containing the heading and `<ol>`, or
+ *   `null` if `route_steps` is empty or absent.
+ * @throws {void} Does not throw.
+ *
+ * @example
+ * const stepsEl = _buildRouteStepsList(data, t(STR));
+ * if (stepsEl) wrap.appendChild(stepsEl);
+ */
+function _buildRouteStepsList(data, s) {
+  if (!data.route_steps || !data.route_steps.length) return null;
+
+  const container = document.createElement("div");
+
+  const heading = document.createElement("p");
+  heading.className = "route-heading";
+  heading.textContent = s.route;
+  container.appendChild(heading);
+
+  const ol = document.createElement("ol");
+  ol.className = "route-steps";
+
+  data.route_steps.forEach((step, idx) => {
+    const li = document.createElement("li");
+    li.style.animationDelay = `${idx * STEP_ANIMATION_DELAY_MS}ms`;
+
+    const numEl = document.createElement("span");
+    numEl.className = "step-num";
+    numEl.setAttribute("aria-hidden", "true");
+    numEl.textContent = step.order || (idx + 1);
+    li.appendChild(numEl);
+
+    const body = document.createElement("div");
+    body.className = "step-body";
+
+    const instr = document.createElement("p");
+    instr.className = "step-instruction";
+    instr.textContent = step.instruction;
+    body.appendChild(instr);
+
+    const meta = document.createElement("div");
+    meta.style.display = "flex";
+    meta.style.alignItems = "center";
+    meta.style.flexWrap = "wrap";
+    meta.style.gap = "0.4rem";
+    meta.style.marginTop = "0.2rem";
+
+    const meansEl = document.createElement("span");
+    meansEl.className = "step-means";
+    meansEl.textContent = (MEANS_EMOJI[step.means] || "➡️") + " " + step.means;
+    meta.appendChild(meansEl);
+
+    if (step.step_free) {
+      const sfEl = document.createElement("span");
+      sfEl.className = "step-sf";
+      sfEl.textContent = s.stepFree;
+      meta.appendChild(sfEl);
+    }
+
+    body.appendChild(meta);
+    li.appendChild(body);
+    ol.appendChild(li);
+  });
+
+  container.appendChild(ol);
+  return container;
+}
+
+/**
+ * Render the full API response into the result panel.
+ *
+ * Clears the result panel, then delegates construction of each section to
+ * the three helper functions: `_buildMetaBadges`, `_buildCrowdPanel`, and
+ * `_buildRouteStepsList`. Appends urgency and alternatives notices inline.
+ *
+ * @param {{
+ *   answer: string,
+ *   facility: {name: string, accessible: boolean},
+ *   crowd_level: 'low'|'medium'|'high',
+ *   accessibility_mode: string,
+ *   urgency: string|null,
+ *   alternatives_note: string|null,
+ *   route_steps: Array.<{order: number, means: string, step_free: boolean, instruction: string}>
+ * }} data - The deserialized JSON response from `POST /api/assist`.
+ * @returns {void}
+ * @throws {void} Does not throw.
+ *
+ * @example
+ * renderResult({
+ *   answer: "Walk to Gate A.", facility: { name: "Gate A", accessible: true },
+ *   crowd_level: "low", accessibility_mode: "standard", route_steps: []
+ * });
+ */
+function renderResult(data) {
+  const s = STR[currentLang] || STR.en;
+  const result = $("result");
+  result.innerHTML = "";
+
+  const wrap = document.createElement("div");
+  wrap.className = "result-enter";
+  result.appendChild(wrap);
+
+  const answer = document.createElement("p");
+  answer.className = "answer";
+  answer.textContent = data.answer;
+  wrap.appendChild(answer);
+
+  wrap.appendChild(_buildMetaBadges(data, s));
+  wrap.appendChild(_buildCrowdPanel(data, s));
 
   if (data.urgency) wrap.appendChild(notice("⚡ " + data.urgency, true));
   if (data.alternatives_note) wrap.appendChild(notice("ℹ️ " + data.alternatives_note, false));
 
-  // Route steps list with staggered entry animation.
-  if (data.route_steps && data.route_steps.length) {
-    const heading = document.createElement("p");
-    heading.className = "route-heading";
-    heading.textContent = s.route;
-    wrap.appendChild(heading);
-
-    const ol = document.createElement("ol");
-    ol.className = "route-steps";
-
-    data.route_steps.forEach((step, idx) => {
-      const li = document.createElement("li");
-      // Stagger each step's entry animation by 80 ms per step.
-      li.style.animationDelay = `${idx * 80}ms`;
-
-      const numEl = document.createElement("span");
-      numEl.className = "step-num";
-      numEl.setAttribute("aria-hidden", "true");
-      numEl.textContent = step.order || (idx + 1);
-      li.appendChild(numEl);
-
-      const body = document.createElement("div");
-      body.className = "step-body";
-
-      const instr = document.createElement("p");
-      instr.className = "step-instruction";
-      instr.textContent = step.instruction;
-      body.appendChild(instr);
-
-      const meta = document.createElement("div");
-      meta.style.display = "flex";
-      meta.style.alignItems = "center";
-      meta.style.flexWrap = "wrap";
-      meta.style.gap = "0.4rem";
-      meta.style.marginTop = "0.2rem";
-
-      const meansEl = document.createElement("span");
-      meansEl.className = "step-means";
-      const meansEmoji = { walk: "🚶", ramp: "♿", elevator: "🛗", stairs: "🪜" };
-      meansEl.textContent = (meansEmoji[step.means] || "➡️") + " " + step.means;
-      meta.appendChild(meansEl);
-
-      if (step.step_free) {
-        const sfEl = document.createElement("span");
-        sfEl.className = "step-sf";
-        sfEl.textContent = s.stepFree;
-        meta.appendChild(sfEl);
-      }
-
-      body.appendChild(meta);
-      li.appendChild(body);
-      ol.appendChild(li);
-    });
-
-    wrap.appendChild(ol);
-  }
+  const stepsEl = _buildRouteStepsList(data, s);
+  if (stepsEl) wrap.appendChild(stepsEl);
 }
 
 // ---------------------------------------------------------------------------
@@ -712,6 +885,10 @@ function renderResult(data) {
  * @param {boolean} urgent - If `true`, applies the `urgent` CSS class for
  *   the high-visibility warning style; otherwise uses the default info style.
  * @returns {HTMLDivElement} The configured notice `<div>` element.
+ *
+ * @example
+ * const urgentNotice = notice("Kickoff is approaching!", true);
+ * container.appendChild(urgentNotice);
  */
 function notice(text, urgent) {
   const div = document.createElement("div");
@@ -733,6 +910,9 @@ function notice(text, urgent) {
  * @param {string} message - The localized error string to display. A ⚠️
  *   emoji is prepended automatically.
  * @returns {void}
+ *
+ * @example
+ * renderError("Network disconnected. Please try again.");
  */
 function renderError(message) {
   const result = $("result");
