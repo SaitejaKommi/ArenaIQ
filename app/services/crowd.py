@@ -1,32 +1,51 @@
 """
 ArenaIQ — Time-based crowd congestion simulation.
 
-The base crowd level of each zone is read from ``crowd.json`` and then
-adjusted according to ``minutes_to_kickoff`` using a rule-based surge model
-calibrated against historical crowd-flow patterns at large stadium venues:
+This module simulates crowd density at stadium zones as a function of
+``minutes_to_kickoff`` using a two-phase bump/relief model:
 
-* **Imminent window** (0–10 min before kickoff): gates and concourses surge
-  by +2 crowd index levels as fans rush to their seats.
-* **Pre-match window** (10–30 min before kickoff): +1 level bump as the
-  stadium fills at a steady pace.
-* **In-play gate relief** (minutes < 0, match underway): gate zones drop by
-  -1 level as fans have entered and the entrances clear.
-* All other zone types (seating bowls) use their base level unmodified.
+Phase 1 — Pre-match surge
+    For zone types that experience crowding (e.g. ``gate``, ``concourse``),
+    the base crowd level is bumped upward in two pre-kickoff time windows:
 
-The surge and relief parameters are read from the ``simulation`` block of
-``crowd.json`` at runtime so they can be tuned without code changes.
+    - **Imminent window** (0 to ``KICKOFF_IMMINENT_MINUTES`` minutes before
+      kickoff): crowd index raised by ``CROWD_BUMP_IMMINENT`` (typically +2).
+    - **Pre-match window** (``KICKOFF_IMMINENT_MINUTES`` to
+      ``KICKOFF_PRE_MATCH_MINUTES`` minutes before kickoff): crowd index
+      raised by ``CROWD_BUMP_PRE_MATCH`` (typically +1).
 
-Typical usage::
+Phase 2 — In-play relief
+    Once the match has started (``minutes_to_kickoff < 0``), gate zones
+    experience a relief bump (``-CROWD_RELIEF_IN_PLAY``) as fans settle
+    into their seats and stop arriving.
+
+The base level for each zone is loaded from the ``crowd.json`` fixture and
+indexed as ``'low'``, ``'medium'``, or ``'high'``. After bumps are applied,
+the result is clamped back into the valid range using :func:`_clamp`.
+
+Constants used (from :mod:`app.utils.constants`):
+    - ``KICKOFF_IMMINENT_MINUTES``
+    - ``KICKOFF_PRE_MATCH_MINUTES``
+    - ``CROWD_BUMP_IMMINENT``
+    - ``CROWD_BUMP_PRE_MATCH``
+    - ``CROWD_RELIEF_IN_PLAY``
+
+Typical usage
+-------------
+The :mod:`~app.services.context_engine` calls :func:`effective_crowd` to
+determine whether the recommended facility is congested and whether to
+trigger a crowd-swap to a quieter alternative::
 
     from app.services.crowd import effective_crowd
-    from app.services.stadium_data import get_stadium
 
-    stadium = get_stadium()
-    level = effective_crowd(stadium, zone_id="gate_a", minutes_to_kickoff=5)
-    # Returns "high" for gate_a with 5 minutes to kickoff.
+    level = effective_crowd(stadium, "gate_a", minutes_to_kickoff=5)
+    # "high" — gates surge to high 5 minutes before kickoff
 """
 
+
 from __future__ import annotations
+
+from typing import Any
 
 from app.services.stadium_data import Stadium
 from app.utils.constants import (
@@ -37,84 +56,116 @@ from app.utils.constants import (
     KICKOFF_PRE_MATCH_MINUTES,
 )
 
-# Ordered crowd level strings; used as an index-based scale for arithmetic bumps.
 _LEVELS: tuple[str, ...] = ("low", "medium", "high")
 _LEVEL_INDEX: dict[str, int] = {level: i for i, level in enumerate(_LEVELS)}
 
 
 def _clamp(index: int) -> str:
-    """Clamp a crowd-level index to the valid range and return the level string.
-
-    Ensures that repeated bumps cannot produce an out-of-bounds index.
-    The valid range is 0 (``"low"``) to ``len(_LEVELS) - 1`` (``"high"``).
+    """Clamp a crowd-level index to the valid range.
 
     Args:
-        index: Integer crowd index, possibly outside the valid range after
-            applying surge bumps or reliefs.
+        index: Computed integer crowd index.
 
     Returns:
-        The crowd level string (``"low"``, ``"medium"``, or ``"high"``)
-        corresponding to the clamped index.
+        One of 'low', 'medium', or 'high'.
+
+    Raises:
+        None
+
+    Example:
+        >>> _clamp(5)
+        'high'
     """
     return _LEVELS[max(0, min(len(_LEVELS) - 1, index))]
+
+
+def _calculate_surge(
+    zone_type: str, surge_types: set[str], minutes_to_kickoff: int, sim: dict[str, Any]
+) -> int:
+    """Calculate the positive crowd index surge for pre-kickoff windows.
+
+    Args:
+        zone_type: The category of the zone (e.g. 'gate').
+        surge_types: Set of zone types that experience surging.
+        minutes_to_kickoff: Minutes until kickoff.
+        sim: Simulation config dictionary from the stadium fixture.
+
+    Returns:
+        Integer crowd bump (0, 1, or 2).
+
+    Raises:
+        None
+
+    Example:
+        >>> _calculate_surge("gate", {"gate"}, 5, {})
+        2
+    """
+    if zone_type not in surge_types:
+        return 0
+    pre: int = int(sim.get("pre_match_window_minutes", KICKOFF_PRE_MATCH_MINUTES))
+    imminent: int = int(sim.get("imminent_window_minutes", KICKOFF_IMMINENT_MINUTES))
+    if 0 <= minutes_to_kickoff <= imminent:
+        return CROWD_BUMP_IMMINENT
+    if imminent < minutes_to_kickoff <= pre:
+        return CROWD_BUMP_PRE_MATCH
+    return 0
+
+
+def _calculate_relief(
+    zone_type: str, minutes_to_kickoff: int, sim: dict[str, Any]
+) -> int:
+    """Calculate the negative crowd relief once the match is underway.
+
+    Args:
+        zone_type: The category of the zone.
+        minutes_to_kickoff: Minutes until kickoff (negative if in-play).
+        sim: Simulation config dictionary.
+
+    Returns:
+        Integer crowd drop (0 or negative).
+
+    Raises:
+        None
+
+    Example:
+        >>> _calculate_relief("gate", -5, {"in_play_gate_relief": True})
+        -1
+    """
+    if minutes_to_kickoff < 0 and zone_type == "gate" and sim.get("in_play_gate_relief"):
+        return -CROWD_RELIEF_IN_PLAY
+    return 0
 
 
 def effective_crowd(stadium: Stadium, zone_id: str, minutes_to_kickoff: int | None) -> str:
     """Return the simulated crowd level for a zone at the given time.
 
-    Applies time-based surge and relief rules on top of the zone's base
-    crowd level. Rules are applied only to zone types listed in the
-    ``surge_zone_types`` key of ``crowd.json`` (typically gates and
-    concourses). Seating bowl zones use their base level unchanged.
-
-    Surge rules (only for surge zone types):
-        * Imminent window (0 ≤ minutes ≤ KICKOFF_IMMINENT_MINUTES):
-          +CROWD_BUMP_IMMINENT levels — fans rushing to seats.
-        * Pre-match window (KICKOFF_IMMINENT_MINUTES < minutes ≤
-          KICKOFF_PRE_MATCH_MINUTES): +CROWD_BUMP_PRE_MATCH level.
-
-    Relief rule (all zone types, gate only):
-        * In-play (minutes < 0): -CROWD_RELIEF_IN_PLAY level — gates clear
-          once the match has started and fans have entered.
+    Combines the static base crowd index with time-based surge and relief
+    bumps calculated by helper functions.
 
     Args:
-        stadium: The loaded :class:`~app.services.stadium_data.Stadium`
-            containing zone metadata and crowd simulation configuration.
-        zone_id: Identifier of the zone whose crowd level is being queried.
-            Unknown zone IDs default to a base crowd index of 0 (``"low"``).
-        minutes_to_kickoff: Minutes until kickoff. Negative values mean the
-            match is underway. ``None`` disables time-based adjustments and
-            returns the raw base level.
+        stadium: The loaded stadium model.
+        zone_id: Zone identifier string.
+        minutes_to_kickoff: Mins to kickoff, or None for base level only.
 
     Returns:
-        One of ``"low"``, ``"medium"``, or ``"high"`` representing the
-        simulated crowd level for the zone at the given time.
+        Crowd level string: 'low', 'medium', or 'high'.
+
+    Raises:
+        None
+
+    Example:
+        >>> level = effective_crowd(stadium, "gate_a", 5)
     """
-    base_index = _LEVEL_INDEX.get(stadium.base_crowd(zone_id), 0)
+    base_index: int = _LEVEL_INDEX.get(stadium.base_crowd(zone_id), 0)
     if minutes_to_kickoff is None:
-        # No time context — return the static base level unmodified.
         return _clamp(base_index)
 
-    sim = stadium.crowd_sim
+    sim: dict[str, Any] = stadium.crowd_sim
     surge_types: set[str] = set(sim.get("surge_zone_types", []))
     zone_type: str = stadium.zone_type(zone_id)
+
     bump: int = 0
-
-    if zone_type in surge_types:
-        # Read thresholds from the JSON fixture so they can be tuned without
-        # code changes. Fall back to the constants if the key is missing.
-        pre: int = int(sim.get("pre_match_window_minutes", KICKOFF_PRE_MATCH_MINUTES))
-        imminent: int = int(sim.get("imminent_window_minutes", KICKOFF_IMMINENT_MINUTES))
-
-        if 0 <= minutes_to_kickoff <= imminent:
-            # Imminent window: fans rushing to seats — strongest surge.
-            bump += CROWD_BUMP_IMMINENT
-        elif imminent < minutes_to_kickoff <= pre:
-            # Pre-match window: stadium filling steadily.
-            bump += CROWD_BUMP_PRE_MATCH
-
-    if minutes_to_kickoff < 0 and zone_type == "gate" and sim.get("in_play_gate_relief"):
-        # Match is underway: gate congestion relieves as fans have entered.
-        bump -= CROWD_RELIEF_IN_PLAY
+    bump += _calculate_surge(zone_type, surge_types, minutes_to_kickoff, sim)
+    bump += _calculate_relief(zone_type, minutes_to_kickoff, sim)
 
     return _clamp(base_index + bump)

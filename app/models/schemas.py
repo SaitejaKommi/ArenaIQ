@@ -1,28 +1,26 @@
 """
-ArenaIQ — Pydantic v2 request/response schemas, enumerations, and validators.
+ArenaIQ — Pydantic schema models for HTTP request/response payloads.
 
-All external input reaches the application exclusively through
-:class:`UserContext`, which enforces strict field constraints via Pydantic v2
-validators. Unknown fields are rejected (``extra="forbid"``), enum values are
-enforced at the type level, and the free-text ``question`` is sanitized by
-:func:`~app.services.security.sanitize_text` before it is stored or forwarded
-to the LLM.
+Provides strict validation and serialization for all data crossing the
+network boundary, with the following design decisions:
 
-Security note:
-    The sanitized ``question`` is injected into the LLM prompt inside an
-    explicitly delimited ``<user_question>`` block. The system prompt instructs
-    the model to treat it as *data only*, never as instructions — this is the
-    second layer of prompt-injection defence on top of input sanitization.
+``extra='forbid'`` security design
+    :class:`UserContext` is configured with ``ConfigDict(extra="forbid")``
+    so that unrecognised fields in the request body raise an HTTP 422 error
+    immediately, preventing parameter-pollution attacks.
 
-Typical usage::
+Validation chain
+    Pydantic field validators run in declaration order:
+    1. ``_sanitize_question`` — strips control characters from free text.
+    2. ``_normalize_needs`` — deduplicates and normalises the needs list.
+    3. ``_validate_zone`` — verifies the zone exists in the loaded stadium.
 
-    from app.models.schemas import UserContext, AssistResponse
-    ctx = UserContext(
-        language="en",
-        current_location="gate_a",
-        destination_intent="restroom",
-        minutes_to_kickoff=20,
-    )
+Zone validator coupling
+    ``_validate_zone`` calls :func:`~app.services.stadium_data.get_stadium`
+    at validation time to check the supplied ``current_location`` against the
+    live stadium fixture. This tight coupling is intentional: it ensures that
+    invalid zone IDs are rejected with Pydantic's standard 422 response
+    rather than propagating deeper into the routing engine.
 """
 
 from __future__ import annotations
@@ -30,44 +28,40 @@ from __future__ import annotations
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic_core.core_schema import ValidationInfo
+
+from app.services.security import sanitize_text
+from app.services.stadium_data import get_stadium
+from app.utils.constants import MAX_QUESTION_LENGTH
 
 
 class Language(StrEnum):
-    """Supported response languages.
+    """Supported UI and voice-output languages.
 
-    The three FIFA World Cup 2026 host-nation languages: English (USA/Canada),
-    Spanish (Mexico), and French (Canada). All API responses, route step
-    instructions, and facility names are fully localized in each language.
+    Attributes:
+        en: English.
+        es: Spanish.
+        fr: French.
     """
-
     en = "en"
     es = "es"
     fr = "fr"
 
 
-class AccessibilityNeed(StrEnum):
-    """Declared accessibility needs that influence routing and response mode.
-
-    ``wheelchair`` and ``visual`` trigger step-free routing (ramps/elevators
-    only) and accessible-only facility filtering. ``hearing`` activates the
-    ``captioned`` response mode that emphasizes visual signage. ``none``
-    signals no special requirements.
-    """
-
-    wheelchair = "wheelchair"
-    visual = "visual"
-    hearing = "hearing"
-    none = "none"
-
-
 class DestinationIntent(StrEnum):
-    """Fan's intended destination category.
+    """The fan's desired destination category.
 
-    Maps to one or more concrete facility types in the stadium graph.
-    ``seat`` is resolved specially from the ticket section number rather
-    than by proximity-based matching.
+    Attributes:
+        restroom: Restrooms / toilets.
+        gate: Entry/exit gates.
+        seat: The fan's ticketed seat.
+        exit: Any stadium exit.
+        first_aid: Medical facilities.
+        concession: Food and beverage.
+        guest_services: Help desks.
+        water: Water fountains.
+        sensory_room: Quiet sensory rooms.
     """
-
     restroom = "restroom"
     gate = "gate"
     seat = "seat"
@@ -79,269 +73,246 @@ class DestinationIntent(StrEnum):
     sensory_room = "sensory_room"
 
 
-class CrowdLevel(StrEnum):
-    """Simulated crowd congestion level at a stadium zone.
+class AccessibilityNeed(StrEnum):
+    """Declared accessibility requirements.
 
-    Derived by the crowd simulation module from the zone's base level and
-    the current ``minutes_to_kickoff``. Values map directly to CSS classes
-    in the frontend for colour-coded crowd indicators.
+    Attributes:
+        none: No specific needs.
+        wheelchair: Requires step-free routing.
+        visual: Requires screen-reader optimized landmarks.
+        hearing: Requires captioned visual instructions.
     """
+    none = "none"
+    wheelchair = "wheelchair"
+    visual = "visual"
+    hearing = "hearing"
 
+
+class CrowdLevel(StrEnum):
+    """Simulated congestion states.
+
+    Attributes:
+        low: Free-flowing traffic.
+        medium: Moderate congestion.
+        high: Severe congestion, triggers rerouting.
+    """
     low = "low"
     medium = "medium"
     high = "high"
 
 
 class AccessibilityMode(StrEnum):
-    """Server-side presentation mode that drives how the UI renders the answer.
+    """Response rendering mode.
 
-    ``screen_reader`` is activated by ``visual`` need — uses landmark-based
-    instructions optimized for assistive technologies.
-    ``captioned`` is activated by ``hearing`` need — emphasizes visible
-    signage references and highlights the Sensory Room option.
-    ``standard`` is the default for fans with no declared accessibility need.
-
-    Note:
-        The client also offers a purely visual "high-visibility" CSS theme
-        toggle, which maps the ``visual`` need to ``screen_reader`` mode
-        server-side.
+    Attributes:
+        standard: Default visual UI.
+        screen_reader: Optimised for screen readers with landmarks.
+        captioned: Visual heavy for hearing impaired.
     """
-
     standard = "standard"
     screen_reader = "screen_reader"
     captioned = "captioned"
 
 
 class UserContext(BaseModel):
-    """Structured fan context — the sole body of ``POST /api/assist``.
-
-    Every field is validated on construction. Unknown fields are rejected
-    (``extra="forbid"``) as a defence-in-depth measure. The ``question``
-    field is sanitized via :func:`~app.services.security.sanitize_text`
-    before the model instance is returned.
+    """The incoming request payload from the fan UI.
 
     Attributes:
-        language: ISO 639-1 code for the desired response language.
-        current_location: A valid stadium zone ID (validated against the
-            live zone registry).
-        destination_intent: The fan's intended destination category.
-        accessibility_needs: Zero or more declared accessibility needs.
-            Normalized so that ``none`` is dropped when real needs exist.
-        ticket_section: Optional ticket section identifier (e.g. ``"134"``).
-            Used to resolve ``seat`` intent to upper/lower bowl.
-        minutes_to_kickoff: Minutes until kickoff; negative values mean
-            the match is already underway. Drives crowd simulation.
-        question: Optional free-text question sanitized and forwarded to
-            the LLM. Treated strictly as data, never as instructions.
+        language: Requested output language.
+        current_location: The zone ID the fan is currently in.
+        destination_intent: The category of facility they want to reach.
+        accessibility_needs: List of declared accessibility needs.
+        minutes_to_kickoff: Integer minutes until match starts.
+        ticket_section: Optional ticket section string (e.g. '112').
+        question: Optional free-text question.
     """
-
     model_config = ConfigDict(extra="forbid")
-
-    language: Language = Language.en
-    current_location: str = Field(..., min_length=1, max_length=40)
+    language: Language
+    current_location: str
     destination_intent: DestinationIntent
-    accessibility_needs: list[AccessibilityNeed] = Field(
-        default_factory=lambda: [AccessibilityNeed.none]
-    )
-    ticket_section: str | None = Field(
-        default=None, max_length=8, pattern=r"^[A-Za-z0-9\- ]{1,8}$"
-    )
-    minutes_to_kickoff: int = Field(..., ge=-120, le=1440)
-    question: str | None = Field(default=None, max_length=280)
+    accessibility_needs: list[AccessibilityNeed] = Field(default_factory=lambda: [AccessibilityNeed.none])
+    minutes_to_kickoff: int = Field(ge=-120, le=1440)
+    ticket_section: str | None = Field(default=None, max_length=10)
+    question: str | None = Field(default=None, max_length=MAX_QUESTION_LENGTH)
+
+    @field_validator("question")
+    @classmethod
+    def _sanitize_question(cls, v: str | None, info: ValidationInfo) -> str | None:
+        """Sanitize the free-text question field.
+
+        Args:
+            v: Raw question string.
+            info: Pydantic validation info.
+
+        Returns:
+            Sanitized string or None.
+
+        Raises:
+            ValueError: If sanitization fails.
+
+        Example:
+            >>> UserContext._sanitize_question("hello \\x00", info)
+            'hello'
+        """
+        if v is None:
+            return None
+        _ = info
+        return sanitize_text(v)
+
+    @field_validator("accessibility_needs")
+    @classmethod
+    def _normalize_needs(
+        cls, v: list[AccessibilityNeed], info: ValidationInfo
+    ) -> list[AccessibilityNeed]:
+        """Deduplicate and normalize the accessibility needs list.
+
+        Args:
+            v: Raw list of needs.
+            info: Pydantic validation info.
+
+        Returns:
+            Normalized list of needs.
+
+        Raises:
+            ValueError: If parsing fails.
+
+        Example:
+            >>> UserContext._normalize_needs([AccessibilityNeed.wheelchair], info)
+        """
+        _ = info
+        if not v:
+            return [AccessibilityNeed.none]
+        needs: set[AccessibilityNeed] = set(v)
+        if AccessibilityNeed.none in needs and len(needs) > 1:
+            needs.remove(AccessibilityNeed.none)
+        return list(needs)
 
     @field_validator("current_location")
     @classmethod
-    def _zone_must_exist(cls, value: str) -> str:
-        """Reject zone IDs that do not exist in the stadium fixture.
+    def _validate_zone(cls, v: str) -> str:
+        """Validate that the supplied zone ID exists in the loaded stadium fixture.
 
-        Imported lazily to avoid a circular import at module load time.
+        Calls :func:`~app.services.stadium_data.get_stadium` to access the
+        in-memory stadium and checks whether ``v`` is a key in
+        :attr:`~app.services.stadium_data.Stadium.zones`.
 
         Args:
-            value: The raw ``current_location`` string from the request body.
+            v: The raw ``current_location`` string from the request body.
 
         Returns:
             The validated zone ID string, unchanged.
 
         Raises:
-            ValueError: If ``value`` is not a recognised stadium zone ID.
+            ValueError: If ``v`` is not a recognised zone ID in the stadium
+                fixture, causing Pydantic to return an HTTP 422 response.
+
+        Example:
+            >>> UserContext._validate_zone("gate_a")
+            'gate_a'
         """
-        from app.services.stadium_data import get_stadium
-
-        if value not in get_stadium().zone_ids():
-            raise ValueError(f"unknown zone id: {value!r}")
-        return value
-
-    @field_validator("accessibility_needs")
-    @classmethod
-    def _normalize_needs(cls, needs: list[AccessibilityNeed]) -> list[AccessibilityNeed]:
-        """Deduplicate needs and drop ``none`` when real needs are present.
-
-        Ensures the downstream rules engine receives a clean, canonical set.
-        If the list would be empty after normalization, ``[none]`` is restored
-        so downstream code can always rely on a non-empty list.
-
-        Args:
-            needs: Raw list of :class:`AccessibilityNeed` values from input.
-
-        Returns:
-            A sorted, deduplicated list of :class:`AccessibilityNeed` values.
-            ``none`` is removed when any real need (wheelchair/visual/hearing)
-            is present. Returns ``[none]`` if all real needs are removed.
-        """
-        unique = set(needs)
-        # ``none`` is meaningless alongside a real need; drop it.
-        if AccessibilityNeed.none in unique and len(unique) > 1:
-            unique.discard(AccessibilityNeed.none)
-        if not unique:
-            unique = {AccessibilityNeed.none}
-        return sorted(unique, key=lambda n: n.value)
-
-    @field_validator("question")
-    @classmethod
-    def _sanitize_question(cls, value: str | None) -> str | None:
-        """Strip control characters and collapse whitespace in the question.
-
-        Delegates to :func:`~app.services.security.sanitize_text`. Returns
-        ``None`` if the sanitized result is an empty string so that the
-        LLM path is not triggered by an effectively empty question.
-
-        Args:
-            value: Raw question string from the request body, or ``None``.
-
-        Returns:
-            A sanitized string with control characters removed and whitespace
-            collapsed, or ``None`` if the result would be empty.
-        """
-        if value is None:
-            return None
-        from app.services.security import sanitize_text
-
-        cleaned = sanitize_text(value)
-        return cleaned or None
+        # Check against cached stadium if loaded.
+        stadium = get_stadium()
+        if v not in stadium.zones:
+            raise ValueError("unknown zone")
+        return v
 
 
 class RouteStep(BaseModel):
-    """One leg of a navigation route with an accessibility-aware instruction.
-
-    Each step describes movement between two zones via a specific travel
-    means (walk, ramp, elevator, or stairs). The ``instruction`` field
-    contains a fully localized, human-readable direction string.
+    """A single step in the navigation route.
 
     Attributes:
-        order: 1-based step index within the route.
-        from_zone: Zone ID of the departure point.
-        to_zone: Zone ID of the arrival point.
-        means: Travel means string (``"walk"``, ``"ramp"``, ``"elevator"``,
-            ``"stairs"``).
-        step_free: ``True`` if this leg is navigable without steps.
-        distance: Approximate walking distance for this leg in metres.
-        landmark: Optional localized landmark description at the destination.
-        instruction: Full localized direction instruction for this step.
+        order: Step sequence number (1-indexed).
+        from_zone: Origin zone ID for this step.
+        to_zone: Destination zone ID for this step.
+        means: Method of transit (walk, ramp, elevator, stairs).
+        step_free: True if this edge is accessible.
+        distance: Walking distance in metres.
+        landmark: Optional localized landmark.
+        instruction: Full localized natural-language instruction sentence.
     """
-
     order: int
     from_zone: str
     to_zone: str
     means: str
     step_free: bool
     distance: int
-    landmark: str | None = None
+    landmark: str | None
     instruction: str
 
 
 class FacilityInfo(BaseModel):
-    """Public representation of a resolved stadium facility.
-
-    Returned as part of :class:`AssistResponse` so the frontend can display
-    facility metadata alongside the navigation instructions.
+    """Public metadata for a stadium facility.
 
     Attributes:
-        id: Unique facility identifier (e.g. ``"restroom_lower_se"``).
-        name: Localized display name of the facility.
-        type: Facility category string (e.g. ``"restroom"``, ``"gate"``).
-        zone: Zone ID where the facility is located.
-        accessible: ``True`` if the facility is wheelchair-accessible.
-        landmark: Optional localized landmark description at the facility.
+        id: Unique facility identifier.
+        name: Localized display name.
+        type: Category type (e.g. restroom).
+        zone: Zone ID where it is located.
+        accessible: True if ADA compliant.
+        landmark: Optional localized landmark description.
     """
-
     id: str
     name: str
     type: str
     zone: str
     accessible: bool
-    landmark: str | None = None
+    landmark: str | None
 
 
 class DecisionResult(BaseModel):
-    """Internal, fully deterministic result of the rules engine (pre-phrasing).
-
-    Produced by :func:`~app.services.context_engine.build_decision` before
-    any LLM is involved. Contains all resolved facts: target facility, route,
-    crowd level, accessibility mode, and any urgency or alternatives note.
-    Never crosses the API boundary — used only internally.
+    """Internal facts container returned by the rules engine.
 
     Attributes:
-        facility: Resolved target facility with localized metadata.
-        route_steps: Ordered list of navigation legs to the facility.
-        crowd_level: Simulated crowd level at the target facility zone.
-        language: Requested response language.
-        accessibility_mode: Presentation mode driven by accessibility needs.
-        landmark_based: ``True`` when the route uses landmark instructions
-            (activated by the ``visual`` accessibility need).
-        hurry: ``True`` when kickoff is imminent and the intent is time-sensitive.
-        alternatives_note: Localized note explaining a crowd-avoidance swap,
-            or ``None`` if the primary facility was selected.
-        urgency: Localized urgency banner text, or ``None`` if not hurried.
+        facility: Selected target facility info.
+        route_steps: Ordered list of route steps.
+        crowd_level: Resolved crowd index.
+        language: Language for strings.
+        accessibility_mode: Decided UI presentation mode.
+        landmark_based: True if route uses landmarks heavily.
+        hurry: True if kickoff is imminent.
+        alternatives_note: Optional notice if crowd-swapped.
+        urgency: Optional urgency warning string.
     """
-
     facility: FacilityInfo
     route_steps: list[RouteStep]
     crowd_level: CrowdLevel
     language: Language
     accessibility_mode: AccessibilityMode
-    landmark_based: bool = False
-    hurry: bool = False
-    alternatives_note: str | None = None
-    urgency: str | None = None
+    landmark_based: bool
+    hurry: bool
+    alternatives_note: str | None
+    urgency: str | None
 
 
 class AssistResponse(BaseModel):
-    """Response body of ``POST /api/assist``.
-
-    Combines the phrased natural-language answer with all the structured
-    route and facility data the frontend needs to render the full response
-    panel, including crowd indicators and route step cards.
+    """The outgoing HTTP response payload to the UI.
 
     Attributes:
-        answer: Localized natural-language answer paragraph (from templates
-            or the Gemini LLM when a question is provided).
-        route_steps: Ordered list of navigation legs to the facility.
-        facility: Resolved target facility with localized metadata.
-        crowd_level: Simulated crowd level at the target facility zone.
-        language: Language used for all localized text in this response.
-        accessibility_mode: Presentation mode communicated to the frontend.
-        alternatives_note: Localized crowd-avoidance note, or ``None``.
-        urgency: Localized urgency banner text, or ``None``.
-        used_llm: ``True`` if Gemini generated the ``answer``; ``False``
-            when the templated short-circuit path was taken.
+        answer: The final natural language response (templated or LLM).
+        route_steps: List of turn-by-turn steps.
+        facility: Target facility metadata.
+        crowd_level: Computed crowd status at destination.
+        language: Selected language.
+        accessibility_mode: Selected display mode.
+        alternatives_note: Notice if rerouted for crowds.
+        urgency: Notice if time-sensitive.
+        used_llm: True if Gemini generated the answer string.
     """
-
     answer: str
     route_steps: list[RouteStep]
     facility: FacilityInfo
     crowd_level: CrowdLevel
     language: Language
     accessibility_mode: AccessibilityMode
-    alternatives_note: str | None = None
-    urgency: str | None = None
+    alternatives_note: str | None
+    urgency: str | None
     used_llm: bool
 
 
 class HealthResponse(BaseModel):
-    """Liveness probe response body for ``GET /health``.
+    """Response payload for the liveness probe.
 
     Attributes:
-        status: Always ``"ok"`` when the application is running and healthy.
+        status: Literal string 'ok'.
     """
-
-    status: str = "ok"
+    status: str
