@@ -1,164 +1,90 @@
 """
-ArenaIQ — Stadium JSON fixture loading and in-memory graph model.
+ArenaIQ — Static stadium data models and graph building.
 
-The three JSON fixtures (``stadium.json``, ``facilities.json``,
-``crowd.json``) are read **once** at first access and cached for the entire
-process lifetime using :func:`functools.lru_cache`. This ensures that
-pathfinding and facility lookups during peak crowd periods carry no I/O
-overhead after the initial load.
-
-Graph model:
-    Stadium zones are nodes and the edges between them form an undirected,
-    weighted graph. Each edge is stored in both directions in the adjacency
-    list so that Dijkstra traversal can proceed in either direction without
-    special-casing. Edge weights are walking distances in metres.
-
-Localization:
-    Zone names, facility names, and landmark descriptions are stored as
-    ``I18n`` dicts (``{"en": ..., "es": ..., "fr": ...}``) within the
-    fixture JSON. The :func:`localized` helper resolves them to a single
-    string for the requested language, falling back to English then any
-    available language.
-
-Typical usage::
-
-    from app.services.stadium_data import get_stadium, localized
-
-    stadium = get_stadium()                         # cached singleton
-    name = stadium.zone_name("gate_a", "es")        # "Puerta A (suroeste)"
-    crowd = stadium.base_crowd("concourse_lower_sw") # "medium"
+Provides the in-memory representation of the stadium zones, facilities,
+and the navigable edge graph used by the routing engine.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from app.logging_conf import get_logger
+
+logger = get_logger(__name__)
 _DATA_DIR: Path = Path(__file__).resolve().parent.parent / "data"
 
-#: Localized text type: a mapping of ISO 639-1 language code → translated string.
-I18n = dict[str, str]
 
-_DEFAULT_LANG: str = "en"
-
-
-def localized(mapping: I18n | None, language: str) -> str | None:
-    """Resolve a localized string with English and any-language fallbacks.
-
-    Looks up ``language`` in ``mapping``. If absent, tries the English key
-    (``"en"``). If that is also absent, returns the first available value.
-    Returns ``None`` only when ``mapping`` is ``None`` or empty.
-
-    Args:
-        mapping: A dict mapping language codes to translated strings, or
-            ``None`` if no localization data is available for this field.
-        language: The desired ISO 639-1 language code (e.g. ``"en"``).
-
-    Returns:
-        The best available localized string, or ``None`` if ``mapping``
-        is falsy (``None`` or empty dict).
-    """
-    if not mapping:
-        return None
-    return mapping.get(language) or mapping.get(_DEFAULT_LANG) or next(iter(mapping.values()))
-
-
-@dataclass
+@dataclass(frozen=True)
 class Zone:
-    """A navigable location node in the stadium zone graph.
-
-    Zones are connected by :class:`Edge` objects to form the pathfinding
-    graph. Zone names are stored as localized ``I18n`` mappings so the UI
-    can display them in the fan's preferred language.
+    """Represents a discrete physical area within the stadium.
 
     Attributes:
-        id: Unique zone identifier (e.g. ``"gate_a"``, ``"concourse_lower_sw"``).
-        names: Localized display names mapping language code → name string.
-        type: Zone category (``"gate"``, ``"concourse"``, or ``"seating"``).
-        level: Physical level descriptor (e.g. ``"ground"``, ``"lower"``,
-            ``"upper"``).
+        id: Unique string identifier for the zone.
+        names: Localized name dictionary (e.g. {"en": "Gate A"}).
+        type: The category of the zone (e.g. "gate", "concourse").
+        level: Integer floor level (0 is ground).
     """
-
     id: str
-    names: I18n
+    names: dict[str, str]
     type: str
-    level: str
+    level: int
 
 
 @dataclass(frozen=True)
 class Edge:
-    """A directed connection from one zone to another in the stadium graph.
-
-    Edges are stored in both directions in the adjacency list, so the graph
-    is effectively undirected. The ``frozen=True`` dataclass is hashable and
-    immutable, making it safe to use as a dict key in the Dijkstra frontier.
+    """Represents a navigable path from one zone to another.
 
     Attributes:
-        to: Zone ID of the destination node.
-        means: Travel means (``"walk"``, ``"ramp"``, ``"elevator"``,
-            ``"stairs"``).
-        step_free: ``True`` if this edge does not require climbing steps —
-            used to filter accessible-only routes for wheelchair/visual users.
-        distance: Approximate walking distance in metres for this edge.
+        to: Destination zone ID.
+        distance: Walking distance in metres.
+        means: Means of transit (e.g. "walk", "stairs").
+        step_free: True if the path is navigable by wheelchair.
     """
-
     to: str
+    distance: int
     means: str
     step_free: bool
-    distance: int
 
 
-@dataclass
+@dataclass(frozen=True)
 class Facility:
-    """A named point of interest located within a stadium zone.
-
-    Facilities are the destinations that fans navigate to (restrooms, gates,
-    first-aid posts, concessions, etc.). Both ``names`` and ``landmarks``
-    are localized to support multilingual route instructions.
+    """Represents an amenity located within a specific zone.
 
     Attributes:
-        id: Unique facility identifier (e.g. ``"restroom_lower_se"``).
-        names: Localized display names mapping language code → name string.
-        type: Facility category (e.g. ``"restroom"``, ``"gate"``,
-            ``"first_aid"``).
-        zone: ID of the zone where this facility is located.
-        accessible: ``True`` if the facility is wheelchair-accessible.
-        landmarks: Optional localized landmark descriptions used in
-            screen-reader-optimized route instructions.
+        id: Unique string identifier.
+        names: Localized name dictionary.
+        type: Category (e.g. "restroom", "first_aid").
+        zone: The zone ID where this facility is physically located.
+        accessible: True if the facility is ADA compliant.
+        landmarks: Optional localized landmark description.
     """
-
     id: str
-    names: I18n
+    names: dict[str, str]
     type: str
     zone: str
     accessible: bool
-    landmarks: I18n | None = None
+    landmarks: dict[str, str] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(frozen=True)
 class Stadium:
-    """In-memory model of the stadium: zones, adjacency graph, facilities, and crowd data.
-
-    Constructed once from the three JSON fixtures and cached for the process
-    lifetime. Exposes a small, well-typed API over the raw data so callers
-    never need to parse JSON dictionaries directly.
+    """The complete in-memory stadium data model.
 
     Attributes:
-        name: Official stadium name (e.g. ``"MetLife Stadium"``).
-        fifa_name: FIFA tournament name for the venue.
-        city: City and state/country string.
-        capacity: Seating capacity as an integer.
-        zones: Dict mapping zone ID → :class:`Zone` for O(1) zone lookup.
-        adjacency: Dict mapping zone ID → list of outgoing :class:`Edge`
-            objects forming the pathfinding graph.
-        facilities: List of all :class:`Facility` objects in the stadium.
-        crowd_base: Dict mapping zone ID → base crowd level string.
-        crowd_sim: Crowd simulation parameters loaded from ``crowd.json``.
+        name: Common stadium name.
+        fifa_name: Official FIFA tournament name.
+        city: Host city name.
+        capacity: Maximum seating capacity.
+        zones: Dictionary mapping zone ID to Zone objects.
+        adjacency: Adjacency list mapping zone ID to a list of Edges.
+        facilities: List of all Facility objects.
+        crowd_base: Dict mapping zone ID to static crowd string.
+        crowd_sim: Dict of crowd simulation config parameters.
     """
-
     name: str
     fifa_name: str
     city: str
@@ -167,198 +93,280 @@ class Stadium:
     adjacency: dict[str, list[Edge]]
     facilities: list[Facility]
     crowd_base: dict[str, str]
-    crowd_sim: dict[str, Any] = field(default_factory=dict)
-
-    def zone_ids(self) -> frozenset[str]:
-        """Return the frozenset of all valid zone IDs.
-
-        Used by the Pydantic validator in :class:`~app.models.schemas.UserContext`
-        to reject requests with unknown ``current_location`` values.
-
-        Returns:
-            A frozenset of zone ID strings loaded from the fixture.
-        """
-        return frozenset(self.zones)
-
-    def zone_name(self, zone_id: str, language: str = _DEFAULT_LANG) -> str:
-        """Return the localized display name for a zone.
-
-        Falls back to the zone ID string itself if the zone is unknown or
-        has no localized name for the requested language.
-
-        Args:
-            zone_id: The zone identifier to look up.
-            language: ISO 639-1 language code for the desired translation.
-                Defaults to ``"en"``.
-
-        Returns:
-            Localized zone name string, or the raw ``zone_id`` as a fallback.
-        """
-        zone = self.zones.get(zone_id)
-        return (localized(zone.names, language) or zone_id) if zone else zone_id
-
-    def zone_type(self, zone_id: str) -> str:
-        """Return the type string for a zone (e.g. ``"gate"``, ``"concourse"``).
-
-        Used by the crowd simulation module to determine whether surge
-        rules apply to a given zone.
-
-        Args:
-            zone_id: The zone identifier to look up.
-
-        Returns:
-            The zone type string, or an empty string if the zone is unknown.
-        """
-        zone = self.zones.get(zone_id)
-        return zone.type if zone else ""
+    crowd_sim: dict[str, Any]
 
     def neighbors(self, zone_id: str) -> list[Edge]:
-        """Return the list of outgoing edges from a zone node.
-
-        Used by the Dijkstra routing algorithm to enumerate reachable
-        neighbors during graph traversal.
+        """Return the outgoing edges from a zone.
 
         Args:
-            zone_id: The zone identifier whose neighbors are requested.
+            zone_id: The ID of the origin zone.
 
         Returns:
-            List of :class:`Edge` objects originating from ``zone_id``.
-            Returns an empty list for unknown zone IDs.
+            List of Edges. Returns empty list if zone not found.
+
+        Raises:
+            None
+
+        Example:
+            >>> edges = stadium.neighbors("gate_a")
         """
         return self.adjacency.get(zone_id, [])
 
-    def facilities_of_types(
-        self, types: set[str], *, accessible_only: bool = False
-    ) -> list[Facility]:
-        """Return facilities whose type is in ``types``, optionally filtering by accessibility.
+    def facilities_of_types(self, types: set[str], *, accessible_only: bool) -> list[Facility]:
+        """Return facilities matching the requested types.
 
         Args:
-            types: Set of facility type strings to include in the results
-                (e.g. ``{"restroom", "accessible_restroom"}``).
-            accessible_only: If ``True``, only facilities with
-                ``accessible=True`` are returned. Defaults to ``False``.
+            types: Set of facility type strings to match.
+            accessible_only: If True, exclude non-accessible facilities.
 
         Returns:
-            A list of matching :class:`Facility` objects in fixture order.
+            List of matching Facility objects.
+
+        Raises:
+            None
+
+        Example:
+            >>> facs = stadium.facilities_of_types({"restroom"}, accessible_only=True)
         """
         return [
-            f
-            for f in self.facilities
-            if f.type in types and (f.accessible or not accessible_only)
+            f for f in self.facilities
+            if f.type in types and (not accessible_only or f.accessible)
         ]
 
-    def base_crowd(self, zone_id: str) -> str:
-        """Return the static base crowd level for a zone from the fixture.
-
-        The base level is the crowd density before any time-based simulation
-        is applied. Unknown zones default to ``"low"``.
+    def zone_name(self, zone_id: str, language: str) -> str:
+        """Resolve the localized display name for a zone.
 
         Args:
-            zone_id: The zone identifier to query.
+            zone_id: The ID of the zone.
+            language: ISO 639-1 language code.
 
         Returns:
-            One of ``"low"``, ``"medium"``, or ``"high"``.
+            Localized name string, or the raw zone ID as fallback.
+
+        Raises:
+            None
+
+        Example:
+            >>> name = stadium.zone_name("gate_a", "en")
+        """
+        zone: Zone | None = self.zones.get(zone_id)
+        if not zone:
+            return zone_id
+        return localized(zone.names, language) or zone_id
+
+    def zone_type(self, zone_id: str) -> str:
+        """Resolve the type category of a zone.
+
+        Args:
+            zone_id: The ID of the zone.
+
+        Returns:
+            Zone type string, or "unknown" if not found.
+
+        Raises:
+            None
+
+        Example:
+            >>> t = stadium.zone_type("gate_a")
+        """
+        zone: Zone | None = self.zones.get(zone_id)
+        return zone.type if zone else "unknown"
+
+    def base_crowd(self, zone_id: str) -> str:
+        """Resolve the static base crowd level for a zone.
+
+        Args:
+            zone_id: The ID of the zone.
+
+        Returns:
+            Base crowd string ('low', 'medium', 'high'). Defaults to 'low'.
+
+        Raises:
+            None
+
+        Example:
+            >>> bc = stadium.base_crowd("gate_a")
         """
         return self.crowd_base.get(zone_id, "low")
 
 
-def _read_json(filename: str) -> dict[str, Any]:
-    """Load and parse a JSON fixture file from the data directory.
+def localized(dictionary: dict[str, str], language: str) -> str | None:
+    """Extract the string for a given language code with English fallback.
 
     Args:
-        filename: The base filename (e.g. ``"stadium.json"``) relative to
-            the ``data/`` directory next to the ``app/`` package.
+        dictionary: Mapping of language codes to localized strings.
+        language: ISO 639-1 language code requested.
 
     Returns:
-        The parsed JSON content as a Python dict.
+        The matching string, the English fallback, or None if neither exist.
 
     Raises:
-        FileNotFoundError: If the fixture file does not exist at the
-            expected path under ``_DATA_DIR``.
-        json.JSONDecodeError: If the file content is not valid JSON.
+        None
+
+    Example:
+        >>> localized({"en": "Hello", "es": "Hola"}, "es")
+        'Hola'
     """
-    with (_DATA_DIR / filename).open(encoding="utf-8") as fh:
-        return json.load(fh)  # type: ignore[no-any-return]
+    if not dictionary:
+        return None
+    return dictionary.get(language, dictionary.get("en", next(iter(dictionary.values()), None)))
+
+
+def _read_json(filename: str) -> dict[str, Any]:
+    """Load a JSON fixture from the data directory.
+
+    Args:
+        filename: Name of the JSON file.
+
+    Returns:
+        The deserialized JSON dict.
+
+    Raises:
+        RuntimeError: If the fixture file cannot be read.
+
+    Example:
+        >>> data = _read_json("stadium.json")
+        >>> "stadium" in data
+        True
+    """
+    try:
+        with (_DATA_DIR / filename).open(encoding="utf-8") as f:
+            return json.load(f)  # type: ignore[no-any-return]
+    except Exception as e:
+        raise RuntimeError(f"Failed to load {filename}: {e}") from e
+
+
+def _parse_zones(raw: list[dict[str, Any]]) -> dict[str, Zone]:
+    """Parse raw zone dicts into Zone dataclasses.
+
+    Args:
+        raw: List of dicts from JSON.
+
+    Returns:
+        Dict mapping zone ID to Zone instance.
+
+    Raises:
+        None
+
+    Example:
+        >>> zones = _parse_zones([{"id": "gate_a", "name": {"en": "Gate A"}, "type": "gate", "level": 0}])
+        >>> zones["gate_a"].type
+        'gate'
+    """
+    return {z["id"]: Zone(z["id"], z.get("name", {}), z["type"], z["level"]) for z in raw}
+
+
+def _parse_edges(raw: list[dict[str, Any]]) -> dict[str, list[Edge]]:
+    """Parse raw edge dicts into graph adjacency lists.
+
+    Each edge in the JSON is treated as undirected: both (from→to) and
+    (to→from) directions are added to the adjacency map so that Dijkstra
+    can traverse the graph in either direction.
+
+    Args:
+        raw: List of dicts from JSON, each with keys ``from``, ``to``,
+            ``distance``, ``means``, and optionally ``step_free``.
+
+    Returns:
+        Dict mapping origin zone ID to list of outgoing :class:`Edge` objects.
+
+    Raises:
+        None
+
+    Example:
+        >>> edges = _parse_edges([{"from": "gate_a", "to": "concourse_1",
+        ...     "distance": 50, "means": "walk", "step_free": True}])
+        >>> len(edges["gate_a"])
+        1
+    """
+    graph: dict[str, list[Edge]] = {}
+    for edge in raw:
+        from_zone_id = edge["from"]
+        to_zone_id = edge["to"]
+        distance = edge["distance"]
+        means = edge["means"]
+        is_step_free = edge.get("step_free", True)
+        graph.setdefault(from_zone_id, []).append(Edge(to_zone_id, distance, means, is_step_free))
+        graph.setdefault(to_zone_id, []).append(Edge(from_zone_id, distance, means, is_step_free))
+    return graph
+
+
+def _parse_facilities(raw: list[dict[str, Any]]) -> list[Facility]:
+    """Parse raw facility dicts into Facility dataclasses.
+
+    Args:
+        raw: List of dicts from JSON.
+
+    Returns:
+        List of Facility instances.
+
+    Raises:
+        None
+
+    Example:
+        >>> facs = _parse_facilities([{"id": "restroom_1", "name": {"en": "Restroom"},
+        ...     "type": "restroom", "zone": "concourse_1", "accessible": True}])
+        >>> facs[0].type
+        'restroom'
+    """
+    return [
+        Facility(f["id"], f.get("name", {}), f["type"], f["zone"], f["accessible"], f.get("landmark", {}))
+        for f in raw
+    ]
 
 
 def _build_stadium() -> Stadium:
-    """Parse the three JSON fixtures and assemble an in-memory :class:`Stadium`.
+    """Assemble the Stadium singleton from the disk fixtures.
 
-    Reads ``stadium.json`` (zones and edges), ``facilities.json`` (points of
-    interest), and ``crowd.json`` (base levels and simulation config).
-    Builds a bidirectional adjacency list so that the Dijkstra implementation
-    in :mod:`app.services.routing` can traverse the graph in either direction.
+    Args:
+        None
 
     Returns:
-        A fully populated :class:`Stadium` instance ready for pathfinding
-        and crowd simulation queries.
+        The loaded Stadium instance.
 
     Raises:
-        FileNotFoundError: If any of the three fixture files is missing.
-        KeyError: If a required field is absent from a fixture JSON object.
+        RuntimeError: If parsing fails.
     """
-    stadium_raw = _read_json("stadium.json")
-    facilities_raw = _read_json("facilities.json")
-    crowd_raw = _read_json("crowd.json")
+    s_data: dict[str, Any] = _read_json("stadium.json")
+    f_data: dict[str, Any] = _read_json("facilities.json")
+    c_data: dict[str, Any] = _read_json("crowd.json")
 
-    # Build zone lookup dict: zone_id → Zone dataclass.
-    zones: dict[str, Zone] = {
-        z["id"]: Zone(id=z["id"], names=z["name"], type=z["type"], level=z["level"])
-        for z in stadium_raw["zones"]
-    }
-
-    # Build an undirected adjacency list from the directed edge list.
-    # Each edge is stored in both directions to allow bidirectional traversal.
-    adjacency: dict[str, list[Edge]] = {zid: [] for zid in zones}
-    for e in stadium_raw["edges"]:
-        src, dst = e["from"], e["to"]
-        adjacency[src].append(
-            Edge(to=dst, means=e["means"], step_free=e["step_free"], distance=e["distance"])
-        )
-        adjacency[dst].append(
-            Edge(to=src, means=e["means"], step_free=e["step_free"], distance=e["distance"])
-        )
-
-    facilities: list[Facility] = [
-        Facility(
-            id=f["id"],
-            names=f["name"],
-            type=f["type"],
-            zone=f["zone"],
-            accessible=f["accessible"],
-            landmarks=f.get("landmark"),
-        )
-        for f in facilities_raw["facilities"]
-    ]
-
-    meta = stadium_raw["stadium"]
     return Stadium(
-        name=meta["name"],
-        fifa_name=meta["fifa_name"],
-        city=meta["city"],
-        capacity=meta["capacity"],
-        zones=zones,
-        adjacency=adjacency,
-        facilities=facilities,
-        crowd_base=dict(crowd_raw["base"]),
-        crowd_sim=dict(crowd_raw.get("simulation", {})),
+        name=s_data["stadium"]["name"],
+        fifa_name=s_data["stadium"]["fifa_name"],
+        city=s_data["stadium"]["city"],
+        capacity=s_data["stadium"]["capacity"],
+        zones=_parse_zones(s_data["zones"]),
+        adjacency=_parse_edges(s_data["edges"]),
+        facilities=_parse_facilities(f_data["facilities"]),
+        crowd_base=c_data.get("base", {}),
+        crowd_sim=c_data.get("simulation", {}),
     )
 
 
-@lru_cache(maxsize=1)
-def get_stadium() -> Stadium:
-    """Return the process-wide cached :class:`Stadium` singleton.
+_STADIUM_CACHE: Stadium | None = None
 
-    Loads and parses the JSON fixtures on first call via :func:`_build_stadium`,
-    then caches the result for all subsequent calls using ``lru_cache``.
-    This guarantees that fixture I/O and graph construction happen at most
-    once per process lifetime, even under concurrent request load.
+
+def get_stadium() -> Stadium:
+    """Return the application-wide cached Stadium singleton.
+
+    Loads the fixture from disk on first call and returns the cached
+    instance on all subsequent calls.
+
+    Args:
+        None
 
     Returns:
-        The singleton :class:`Stadium` instance populated from the JSON fixtures.
+        The loaded Stadium singleton.
 
     Raises:
-        FileNotFoundError: If any fixture file is missing (propagated from
-            :func:`_build_stadium` on first call only).
+        RuntimeError: If the fixture file is missing or unparseable.
+
+    Example:
+        >>> s = get_stadium()
     """
-    return _build_stadium()
+    global _STADIUM_CACHE
+    if _STADIUM_CACHE is None:
+        _STADIUM_CACHE = _build_stadium()
+        logger.info("Loaded stadium %s with %d zones", _STADIUM_CACHE.name, len(_STADIUM_CACHE.zones))
+    return _STADIUM_CACHE
