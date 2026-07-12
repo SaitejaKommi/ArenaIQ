@@ -1,43 +1,50 @@
 """
-ArenaIQ — FastAPI application factory, HTTP endpoints, middleware, and static UI.
+ArenaIQ — FastAPI application factory and HTTP endpoints.
 
-This module is the ASGI entry point for the ArenaIQ backend. It exports a
-module-level ``app`` instance created by :func:`create_app` for use with
-uvicorn (``uvicorn app.main:app``), and exposes :func:`create_app` for use
-by the test suite with custom :class:`~app.config.Settings`.
+This module is the composition root for the entire ASGI application.
+It wires together all service singletons, middleware, exception handlers,
+and route definitions into a single configured :class:`fastapi.FastAPI` instance.
 
-Endpoints:
-    * ``GET  /``               — Serves the accessible single-page UI (index.html).
-    * ``GET  /health``         — Liveness probe; returns ``{"status": "ok"}``.
-    * ``POST /api/assist``     — Context-aware routing assistance (rate-limited).
-    * ``GET  /api/stadium``    — Zone/facility metadata for the frontend UI.
-    * ``GET  /static/{file}``  — Mounted static file server for CSS/JS assets.
+Startup lifecycle
+-----------------
+When ``create_app()`` is called (at module load time for uvicorn), the
+following steps execute in order:
 
-Security:
-    * CORS is restricted to an explicit allow-list plus a Vercel subdomain
-      regex. Wildcard origins are never used.
-    * HTTP security headers (CSP, X-Frame-Options, etc.) are injected by
-      a middleware layer on every response.
-    * The ``/api/assist`` endpoint is protected by a per-IP token-bucket
-      rate limiter; excessive callers receive HTTP 429.
-    * All user input is validated by Pydantic and sanitized by
-      :func:`~app.services.security.sanitize_text` before reaching any
-      service layer or LLM.
+1. ``_init_state(app, conf)`` — constructs and attaches process-wide
+   singletons (stadium fixture, LLM client, rate limiter) onto ``app.state``
+   so all request handlers share the same objects without global mutation.
 
-Typical usage::
+2. ``_register_middleware(app, conf)`` — attaches:
+   - ``CORSMiddleware`` allowing the configured origins plus any
+     ``*.vercel.app`` domain for preview deployments.
+   - An ``add_security_headers`` HTTP middleware that injects ``X-Frame-Options``,
+     ``Content-Security-Policy``, and related headers on every response.
 
-    # Production — uvicorn reads the module-level ``app`` directly:
-    # uvicorn app.main:app --host 0.0.0.0 --port 8000
+3. ``_register_handlers(app)`` — attaches a custom exception handler that
+   translates :class:`~app.services.context_engine.RouteNotFound` exceptions
+   into HTTP 404 JSON responses.
 
-    # Tests — use create_app with an injected Settings instance:
-    from app.main import create_app
-    from app.config import Settings
-    app = create_app(Settings(gemini_api_key=None))
+4. ``_register_routes(app)`` — registers the four HTTP endpoints:
+   ``GET /health``, ``GET /api/stadium``, ``POST /api/assist``, ``GET /``.
+   A ``/static`` mount for CSS/JS assets is added last.
+
+Security model
+--------------
+Every response carries a strict Content-Security-Policy header
+(``default-src 'self'``) enforced by the ``add_security_headers`` middleware.
+Incoming requests to ``POST /api/assist`` pass through a token-bucket
+:class:`~app.services.security.RateLimiter` injected as a FastAPI dependency,
+returning HTTP 429 when the per-IP bucket is exhausted.
+
+Mount points
+------------
+- ``/static`` → serves ``app/static/`` files (CSS, JS).
+- ``/``       → serves ``app/static/index.html`` directly (SPA root).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -65,8 +72,6 @@ logger = get_logger("arenaiq")
 
 _STATIC_DIR: Path = Path(__file__).resolve().parent / "static"
 
-# Security response headers applied to every HTTP response by the middleware layer.
-# CSP disallows inline scripts and restricts resource origins to ``'self'`` only.
 _SECURITY_HEADERS: dict[str, str] = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
@@ -78,47 +83,82 @@ _SECURITY_HEADERS: dict[str, str] = {
 }
 
 
+def _build_metadata_zones(stadium: Stadium) -> list[dict[str, Any]]:
+    """Build the zones array for the ``/api/stadium`` metadata response.
+
+    Args:
+        stadium: The loaded :class:`~app.services.stadium_data.Stadium` model.
+
+    Returns:
+        A list of dicts, each containing ``id``, ``name``, ``type``, and
+        ``level`` for one zone in the stadium.
+
+    Raises:
+        None
+
+    Example:
+        >>> zones = _build_metadata_zones(get_stadium())
+        >>> zones[0].keys()
+        dict_keys(['id', 'name', 'type', 'level'])
+    """
+    return [
+        {"id": z.id, "name": z.names, "type": z.type, "level": z.level}
+        for z in stadium.zones.values()
+    ]
+
+
+def _build_metadata_facs(stadium: Stadium) -> list[dict[str, Any]]:
+    """Build the facilities array for the ``/api/stadium`` metadata response.
+
+    Args:
+        stadium: The loaded :class:`~app.services.stadium_data.Stadium` model.
+
+    Returns:
+        A list of dicts, each containing ``id``, ``name``, ``type``, ``zone``,
+        ``accessible``, and ``landmark`` for one facility.
+
+    Raises:
+        None
+
+    Example:
+        >>> facs = _build_metadata_facs(get_stadium())
+        >>> facs[0].keys()
+        dict_keys(['id', 'name', 'type', 'zone', 'accessible', 'landmark'])
+    """
+    return [
+        {
+            "id": f.id, "name": f.names, "type": f.type,
+            "zone": f.zone, "accessible": f.accessible, "landmark": f.landmarks,
+        }
+        for f in stadium.facilities
+    ]
+
+
 def _stadium_metadata(stadium: Stadium) -> dict[str, Any]:
     """Serialize zones, facilities, and enum vocabularies for the frontend.
 
-    Converts the in-memory :class:`~app.services.stadium_data.Stadium`
-    into a plain JSON-serializable dict used by the ``GET /api/stadium``
-    endpoint. Zone and facility names/landmarks are returned as localized
-    maps (``{"en": ..., "es": ..., "fr": ...}``) so the frontend can
-    render the correct language client-side without additional API calls.
-
     Args:
-        stadium: The loaded :class:`~app.services.stadium_data.Stadium`
-            singleton from ``app.state.stadium``.
+        stadium: The loaded stadium model.
 
     Returns:
-        A JSON-serializable dict with keys ``stadium``, ``zones``,
-        ``facilities``, ``intents``, ``languages``, and
-        ``accessibility_needs``.
+        JSON-serializable metadata dict with keys ``stadium``, ``zones``,
+        ``facilities``, ``intents``, ``languages``, and ``accessibility_needs``.
+
+    Raises:
+        None
+
+    Example:
+        >>> meta = _stadium_metadata(get_stadium())
+        >>> set(meta.keys())
+        {'stadium', 'zones', 'facilities', 'intents', 'languages', 'accessibility_needs'}
     """
     return {
         "stadium": {
-            "name": stadium.name,
-            "fifa_name": stadium.fifa_name,
-            "city": stadium.city,
-            "capacity": stadium.capacity,
+            "name": stadium.name, "fifa_name": stadium.fifa_name,
+            "city": stadium.city, "capacity": stadium.capacity,
         },
-        # ``name``/``landmark`` are localized maps ({en, es, fr}); the UI picks the language.
-        "zones": [
-            {"id": z.id, "name": z.names, "type": z.type, "level": z.level}
-            for z in stadium.zones.values()
-        ],
-        "facilities": [
-            {
-                "id": f.id,
-                "name": f.names,
-                "type": f.type,
-                "zone": f.zone,
-                "accessible": f.accessible,
-                "landmark": f.landmarks,
-            }
-            for f in stadium.facilities
-        ],
+        "zones": _build_metadata_zones(stadium),
+        "facilities": _build_metadata_facs(stadium),
         "intents": [i.value for i in DestinationIntent],
         "languages": [lang.value for lang in Language],
         "accessibility_needs": [n.value for n in AccessibilityNeed],
@@ -126,64 +166,54 @@ def _stadium_metadata(stadium: Stadium) -> dict[str, Any]:
 
 
 def _rate_limit_dependency(request: Request) -> None:
-    """FastAPI dependency that enforces per-IP rate limiting on protected endpoints.
-
-    Retrieves the shared :class:`~app.services.security.RateLimiter` from
-    ``app.state`` and checks whether the requesting IP has tokens remaining.
-    Rejected requests receive HTTP 429 with a ``Retry-After`` header.
+    """FastAPI dependency enforcing per-IP rate limiting.
 
     Args:
-        request: The incoming FastAPI :class:`fastapi.Request` object,
-            used to access ``app.state.rate_limiter`` and the client IP.
+        request: Incoming FastAPI request object used to extract the client IP.
 
     Returns:
-        None if the request is within the rate limit.
+        None (raises HTTPException if the bucket is exhausted).
 
     Raises:
-        fastapi.HTTPException: With status 429 and ``Retry-After`` header
-            when the client has exceeded its token-bucket allowance.
+        HTTPException: HTTP 429 status with ``Retry-After`` header when the
+            client's token bucket is empty.
+
+    Example:
+        >>> Depends(_rate_limit_dependency)
     """
     limiter: RateLimiter = request.app.state.rate_limiter
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip: str = request.client.host if request.client else "unknown"
     allowed, retry_after = limiter.check(client_ip)
     if not allowed:
         raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded. Please slow down.",
+            status_code=429, detail="Rate limit exceeded.",
             headers={"Retry-After": str(int(retry_after) + 1)},
         )
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
-    """Application factory that builds and configures the FastAPI ASGI application.
+def _init_state(app: FastAPI, settings: Settings) -> None:
+    """Initialize process-wide singletons and attach them to ``app.state``.
 
-    Initialises all process-wide singletons (stadium data, LLM client, rate
-    limiter) on the ``app.state``, registers CORS and security-header
-    middleware, registers the exception handler for :class:`RouteNotFound`,
-    and mounts all route handlers and the static file server.
-
-    Accepting an explicit ``settings`` argument allows the test suite to
-    inject a custom :class:`~app.config.Settings` instance (e.g. with
-    ``gemini_api_key=None``) without modifying environment variables.
+    All heavy objects (stadium graph, LLM client, rate limiter) are
+    constructed once here so that route handlers can access them via
+    ``request.app.state`` without triggering repeated initialisation.
 
     Args:
-        settings: Optional :class:`~app.config.Settings` instance. If
-            ``None``, the process-wide cached instance from
-            :func:`~app.config.get_settings` is used.
+        app: The :class:`fastapi.FastAPI` instance to attach state onto.
+        settings: Application settings providing API keys and limits.
 
     Returns:
-        A fully configured :class:`fastapi.FastAPI` application instance
-        ready to be served by an ASGI server such as uvicorn.
+        None
+
+    Raises:
+        None
+
+    Example:
+        >>> app = FastAPI()
+        >>> _init_state(app, get_settings())
+        >>> hasattr(app.state, "stadium")
+        True
     """
-    settings = settings or get_settings()
-
-    app = FastAPI(
-        title="ArenaIQ",
-        description="Multilingual, accessible stadium assistant for FIFA World Cup 2026.",
-        version="1.0.0",
-    )
-
-    # Attach process-wide singletons to app.state for injection into route handlers.
     app.state.settings = settings
     app.state.stadium = get_stadium()
     app.state.llm = get_llm_client(settings)
@@ -191,72 +221,142 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings.rate_limit_capacity, settings.rate_limit_refill_per_sec
     )
 
-    # Restrictive CORS: explicit allow-list (localhost dev) plus a Vercel subdomain
-    # regex for production deployments. Wildcard origins are never permitted.
+
+def _register_middleware(app: FastAPI, settings: Settings) -> None:
+    """Attach CORS and security-header middleware to the application.
+
+    Registers two middleware layers:
+    1. :class:`fastapi.middleware.cors.CORSMiddleware` allowing the origins
+       specified in settings plus any ``*.vercel.app`` preview domain.
+    2. An ``add_security_headers`` HTTP middleware that injects hardened
+       headers (CSP, X-Frame-Options, etc.) on every outgoing response.
+
+    Args:
+        app: The :class:`fastapi.FastAPI` instance to register middleware on.
+        settings: Application settings providing the CORS allow-list.
+
+    Returns:
+        None
+
+    Raises:
+        None
+
+    Example:
+        >>> app = FastAPI()
+        >>> _register_middleware(app, get_settings())
+    """
     app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.allowed_origins,
-        allow_origin_regex=r"^https://.*\.vercel\.app$",
-        allow_credentials=False,
-        allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type"],
+        CORSMiddleware, allow_origins=settings.allowed_origins,
+        allow_origin_regex=r"^https://.*\.vercel\.app$", allow_credentials=False,
+        allow_methods=["GET", "POST"], allow_headers=["Content-Type"],
     )
 
     @app.middleware("http")
-    async def add_security_headers(request: Request, call_next: Callable) -> Response:
-        """Inject security headers into every HTTP response.
+    async def add_security_headers(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        """Inject hardened HTTP security headers on every outgoing response.
 
-        Uses ``setdefault`` so that route handlers can override individual
-        headers for specific responses without this middleware overwriting them.
+        Calls the next middleware/handler and then sets all headers defined
+        in ``_SECURITY_HEADERS`` using ``setdefault`` so that route handlers
+        can override individual headers if needed.
 
         Args:
-            request: The incoming HTTP request (passed through unchanged).
-            call_next: The next middleware or route handler in the ASGI stack.
+            request: The incoming HTTP request.
+            call_next: The next handler in the middleware chain.
 
         Returns:
-            The HTTP response with all ``_SECURITY_HEADERS`` applied.
-        """
-        response = await call_next(request)
-        for header, value in _SECURITY_HEADERS.items():
-            response.headers.setdefault(header, value)
-        return response
+            The HTTP response with security headers added.
 
+        Raises:
+            None
+        """
+        res: Response = await call_next(request)
+        for h, v in _SECURITY_HEADERS.items():
+            res.headers.setdefault(h, v)
+        return res
+
+
+def _register_handlers(app: FastAPI) -> None:
+    """Attach custom exception handlers to translate domain errors to HTTP responses.
+
+    Args:
+        app: The :class:`fastapi.FastAPI` instance to register handlers on.
+
+    Returns:
+        None
+
+    Raises:
+        None
+
+    Example:
+        >>> app = FastAPI()
+        >>> _register_handlers(app)
+    """
     @app.exception_handler(RouteNotFound)
     async def _route_not_found_handler(request: Request, exc: RouteNotFound) -> JSONResponse:
-        """Convert a :class:`RouteNotFound` domain exception to an HTTP 404 response.
+        """Translate a RouteNotFound domain exception into an HTTP 404 response.
 
         Args:
-            request: The incoming HTTP request (unused but required by FastAPI).
-            exc: The :class:`RouteNotFound` exception carrying a descriptive message.
+            request: The incoming HTTP request (unused, required by FastAPI signature).
+            exc: The :class:`~app.services.context_engine.RouteNotFound` exception.
 
         Returns:
             A :class:`fastapi.responses.JSONResponse` with status 404 and
-            ``{"detail": <exception message>}`` body.
+            a ``detail`` key containing the exception message.
+
+        Raises:
+            None
         """
         return JSONResponse(status_code=404, content={"detail": str(exc)})
 
+
+def _register_routes(app: FastAPI) -> None:
+    """Register all HTTP route handlers onto the FastAPI application.
+
+    Defines four endpoints:
+    - ``GET /health`` — liveness probe.
+    - ``GET /api/stadium`` — static stadium metadata for the frontend.
+    - ``POST /api/assist`` — main navigation endpoint (rate-limited).
+    - ``GET /`` — serves the SPA ``index.html``.
+
+    Args:
+        app: The :class:`fastapi.FastAPI` instance to register routes on.
+
+    Returns:
+        None
+
+    Raises:
+        None
+
+    Example:
+        >>> app = FastAPI()
+        >>> _register_routes(app)
+    """
     @app.get("/health", response_model=HealthResponse, tags=["system"])
     async def health() -> HealthResponse:
-        """Liveness probe endpoint — returns OK without touching the LLM or database.
+        """Liveness probe endpoint.
 
         Returns:
-            A :class:`~app.models.schemas.HealthResponse` with ``status="ok"``.
+            :class:`~app.models.schemas.HealthResponse` with ``status='ok'``
+            confirming the server is running.
+
+        Raises:
+            None
         """
         return HealthResponse(status="ok")
 
     @app.get("/api/stadium", tags=["data"])
     async def stadium_metadata(request: Request) -> dict[str, Any]:
-        """Return serialized stadium zone, facility, and vocabulary metadata.
-
-        Used by the frontend on page load to populate the location and
-        destination selectors with localized options.
-
-        Args:
-            request: The incoming HTTP request providing access to
-                ``app.state.stadium``.
+        """Return static stadium metadata used to populate the frontend dropdowns.
 
         Returns:
-            A JSON-serializable dict produced by :func:`_stadium_metadata`.
+            A JSON dict containing ``stadium`` info, ``zones`` list, ``facilities``
+            list, and the supported enum vocabularies (``intents``, ``languages``,
+            ``accessibility_needs``).
+
+        Raises:
+            None
         """
         return _stadium_metadata(request.app.state.stadium)
 
@@ -267,61 +367,78 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         tags=["assist"],
     )
     async def assist(ctx: UserContext, request: Request) -> AssistResponse:
-        """Run the rules engine and optional LLM to produce a stadium navigation response.
+        """Context-driven navigation endpoint — the core ArenaIQ functionality.
 
-        The rate-limit dependency is evaluated before this handler executes.
-        Structured context is passed to :func:`~app.services.context_engine.run_assist`
-        which resolves routing facts deterministically before engaging the LLM.
-
-        Privacy note: only non-identifying signals (zone IDs, intents, crowd
-        level, LLM usage flag) are logged — the raw ``question`` is never
-        written to the log stream.
+        Validates the incoming :class:`~app.models.schemas.UserContext`,
+        runs the deterministic rules engine, phrases the result via the LLM
+        client or offline templates, and returns the fully grounded response.
 
         Args:
-            ctx: The validated :class:`~app.models.schemas.UserContext`
-                deserialized from the POST request body.
-            request: The incoming HTTP request providing access to
-                ``app.state.stadium`` and ``app.state.llm``.
+            ctx: Validated user context from the request body.
+            request: FastAPI request object used to access ``app.state``.
 
         Returns:
-            A fully populated :class:`~app.models.schemas.AssistResponse`.
+            :class:`~app.models.schemas.AssistResponse` containing the answer,
+            route steps, facility info, crowd level, and LLM attribution flag.
 
         Raises:
-            RouteNotFound: When no facility/route satisfies the request
-                constraints (caught by ``_route_not_found_handler`` → 404).
-            fastapi.HTTPException: 429 when the IP rate limit is exceeded
-                (raised by ``_rate_limit_dependency`` before this handler).
+            HTTPException: 422 if the request body fails Pydantic validation.
+            HTTPException: 429 if the rate limit is exceeded.
+            JSONResponse(404): If no route or facility matches the request.
         """
         stadium: Stadium = request.app.state.stadium
-        llm = request.app.state.llm
-        response = await run_assist(ctx, stadium, llm)
-        # Privacy-preserving log: intents, zones, outcomes only — never the question.
+        res: AssistResponse = await run_assist(ctx, stadium, request.app.state.llm)
         logger.info(
             "assist location=%s intent=%s needs=%s crowd=%s used_llm=%s",
-            ctx.current_location,
-            ctx.destination_intent.value,
+            ctx.current_location, ctx.destination_intent.value,
             "+".join(n.value for n in ctx.accessibility_needs),
-            response.crowd_level.value,
-            response.used_llm,
+            res.crowd_level.value, res.used_llm,
         )
-        return response
+        return res
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
-        """Serve the ArenaIQ single-page application HTML shell.
+        """Serve the ArenaIQ single-page application HTML entry point.
 
         Returns:
-            A :class:`fastapi.responses.FileResponse` streaming ``index.html``
+            :class:`fastapi.responses.FileResponse` streaming ``index.html``
             from the static directory.
+
+        Raises:
+            None
         """
         return FileResponse(_STATIC_DIR / "index.html")
 
-    # Mount the static file server for CSS/JS assets after the explicit ``/`` route
-    # so that ``/`` itself is handled by the ``index`` handler above.
-    app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
+def create_app(settings: Settings | None = None) -> FastAPI:
+    """Build and configure the FastAPI ASGI application.
+
+    Args:
+        settings: Optional custom :class:`~app.config.Settings` instance.
+            Defaults to the cached singleton from :func:`~app.config.get_settings`.
+
+    Returns:
+        A fully configured :class:`fastapi.FastAPI` instance ready for
+        serving with uvicorn.
+
+    Raises:
+        None
+
+    Example:
+        >>> app = create_app()
+        >>> type(app).__name__
+        'FastAPI'
+    """
+    conf: Settings = settings or get_settings()
+    app = FastAPI(title="ArenaIQ", version="1.0.0")
+
+    _init_state(app, conf)
+    _register_middleware(app, conf)
+    _register_handlers(app)
+    _register_routes(app)
+
+    app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
     return app
 
 
-# Module-level ASGI application instance for ``uvicorn app.main:app``.
 app = create_app()
