@@ -1,73 +1,98 @@
 """
-ArenaIQ — Privacy-preserving structured logging configuration.
+ArenaIQ — Standardised JSON logging configuration.
 
-Security requirement: secrets and raw PII must *never* reach the log stream.
-Application code logs only non-identifying signals: zone IDs, destination
-intents, crowd levels, and boolean outcomes. The raw free-text ``question``
-and the Gemini API key are explicitly excluded from all log calls.
-
-The module uses a ``_CONFIGURED`` guard to make ``configure_logging``
-idempotent — safe to call multiple times (e.g. from tests and from the
-application factory) without duplicating handlers or changing the level.
-
-Typical usage::
-
-    from app.logging_conf import get_logger
-    logger = get_logger(__name__)
-    logger.info("assist location=%s intent=%s", zone_id, intent)
+Provides structured JSON logging for all environments, ensuring
+consistency between local development output and production log aggregators,
+using only the Python standard library.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import sys
+from typing import Any
 
-_CONFIGURED: bool = False
+
+class JSONFormatter(logging.Formatter):
+    """Custom JSON formatter using standard library json module."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Format the log record as a JSON string.
+
+        Args:
+            record: The log record to format.
+
+        Returns:
+            JSON string representation of the log.
+
+        Raises:
+            None
+        """
+        payload = {
+            "time": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "name": record.name,
+            "message": record.getMessage(),
+        }
+        return json.dumps(payload)
+
+
+def _get_handler() -> logging.StreamHandler:  # type: ignore[type-arg]
+    """Create and configure the stdout stream handler.
+
+    Args:
+        None
+
+    Returns:
+        Configured StreamHandler.
+
+    Raises:
+        None
+    """
+    handler: logging.StreamHandler[Any] = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JSONFormatter(datefmt="%Y-%m-%dT%H:%M:%SZ"))
+    return handler
 
 
 def configure_logging(level: int = logging.INFO) -> None:
-    """Configure the root logger once, idempotently.
-
-    Sets up a ``basicConfig`` handler that writes timestamped, levelled
-    log records to stderr. Subsequent calls are no-ops, so it is safe to
-    call from both the application factory and test fixtures.
+    """Configure the root logger with JSON formatting.
 
     Args:
-        level: The minimum severity level to emit, expressed as a
-            ``logging`` integer constant (e.g. ``logging.DEBUG``,
-            ``logging.INFO``). Defaults to ``logging.INFO``.
+        level: Minimum log level integer (e.g. logging.INFO).
 
     Returns:
         None
 
     Raises:
-        TypeError: If ``level`` is not an integer.
+        None
+
+    Example:
+        >>> configure_logging(logging.DEBUG)
     """
-    global _CONFIGURED
-    if _CONFIGURED:
-        return
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    _CONFIGURED = True
+    root: logging.Logger = logging.getLogger()
+    root.setLevel(level)
+
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    root.addHandler(_get_handler())
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Return a namespaced logger, ensuring root logging is configured first.
-
-    Calls ``configure_logging`` (idempotent) before returning the logger,
-    guaranteeing that the first log record is never lost due to the root
-    handler not yet being attached.
+    """Retrieve a configured child logger instance.
 
     Args:
-        name: The logger namespace, typically ``__name__`` of the calling
-            module (e.g. ``"app.services.llm"``).
+        name: The name of the module or component.
 
     Returns:
-        A ``logging.Logger`` instance scoped to ``name``.
+        Configured Logger instance.
 
     Raises:
-        TypeError: If ``name`` is not a string.
+        None
+
+    Example:
+        >>> log = get_logger("app.main")
+        >>> log.info("Server started.")
     """
-    configure_logging()
     return logging.getLogger(name)
