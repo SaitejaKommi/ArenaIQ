@@ -1,352 +1,66 @@
 """
-ArenaIQ — Deterministic, offline natural-language response generation.
+ArenaIQ — Static template localization and text generation.
 
-Turns the rules engine's structured decision facts into localized prose in
-English, Spanish, and French without any LLM or network call. This module
-serves two roles simultaneously:
+This module is the OFFLINE rendering path for the ArenaIQ assistant.
+It provides templated natural-language responses in English, Spanish, and
+French for all routing and accessibility scenarios, operating entirely
+without any network calls or LLM dependency.
 
-1. **Short-circuit answer path**: When the fan provides no free-text question,
-   :func:`render_answer` is called directly and the LLM is bypassed entirely.
-2. **MockLLM fallback**: :class:`~app.services.llm.MockLLM` delegates to
-   :func:`render_answer`, making the application fully functional offline
-   and making the test suite deterministic and network-free.
+Relation to the LLM strategy pattern
+--------------------------------------
+The codebase uses a ``Rules-Before-LLM`` architecture:
+1. ``context_engine.py`` resolves all facts deterministically.
+2. Those facts are packaged into a :class:`PhrasingContext`.
+3. If the user supplied a free-text question, the context is passed to
+   ``llm.phrase()`` (Gemini or MockLLM).
+4. If no question was asked — or if Gemini fails — ``render_answer()``
+   (this module) is called directly to produce a fully grounded, offline,
+   template-based answer.
 
-All localized strings for UI chrome live in per-language lookup tables in
-this module. Facility names, zone names, and landmark descriptions are
-localized in the JSON fixtures (``facilities.json``, ``stadium.json``) and
-resolved by :func:`~app.services.stadium_data.localized`.
+``render_answer`` is also the fallback used by :class:`~app.services.llm.MockLLM`,
+which simply delegates to it instead of calling any external API.
 
-Performance:
-    :func:`render_answer` is decorated with ``lru_cache(maxsize=256)``
-    because :class:`PhrasingContext` is a frozen dataclass (hashable).
-    Repeated requests with the same context — common during peak load —
-    hit the cache and return without any string formatting work.
+Typical usage
+-------------
+::
 
-Typical usage::
+    from app.services.phrasing import PhrasingContext, render_answer
 
-    from app.services.phrasing import render_answer, PhrasingContext
     ctx = PhrasingContext(
-        language="en",
-        facility_name="North-East Accessible Restroom",
-        facility_type="accessible_restroom",
-        facility_landmark="beside the North-East elevator",
-        crowd_level="low",
-        accessibility_mode="screen_reader",
-        landmark_based=True,
-        hurry=False,
-        alternative_type=None,
-        total_distance=120,
-        step_count=3,
+        language="en", facility_name="Gate A", facility_type="gate",
+        facility_landmark="beside the escalator", crowd_level="medium",
+        accessibility_mode="standard", landmark_based=False, hurry=False,
+        alternative_type=None, total_distance=120, step_count=3,
     )
     answer = render_answer(ctx)
+    # "Your route to Gate A is 120m long and takes 3 steps. ..."
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from typing import Any
 
 from app.utils.constants import DEFAULT_LANGUAGE
-
-# ---------------------------------------------------------------------------
-# Localization tables
-# ---------------------------------------------------------------------------
-
-# Movement verb per travel means (imperative, lower-cased; capitalized on use).
-_MEANS: dict[str, dict[str, str]] = {
-    "en": {
-        "walk": "walk",
-        "ramp": "take the ramp",
-        "elevator": "take the elevator",
-        "stairs": "take the stairs",
-    },
-    "es": {
-        "walk": "camine",
-        "ramp": "tome la rampa",
-        "elevator": "tome el ascensor",
-        "stairs": "suba por las escaleras",
-    },
-    "fr": {
-        "walk": "marchez",
-        "ramp": "empruntez la rampe",
-        "elevator": "prenez l'ascenseur",
-        "stairs": "prenez les escaliers",
-    },
-}
-
-_CROWD_WORD: dict[str, dict[str, str]] = {
-    "en": {"low": "low", "medium": "moderate", "high": "high"},
-    "es": {"low": "baja", "medium": "moderada", "high": "alta"},
-    "fr": {"low": "faible", "medium": "modérée", "high": "élevée"},
-}
-
-_TYPE_LABEL: dict[str, dict[str, str]] = {
-    "en": {
-        "restroom": "restroom",
-        "accessible_restroom": "accessible restroom",
-        "first_aid": "first aid station",
-        "concession": "concession",
-        "guest_services": "guest services desk",
-        "water": "water refill point",
-        "sensory_room": "sensory room",
-        "exit": "exit",
-        "gate": "gate",
-        "seat": "seat",
-        "elevator": "elevator",
-    },
-    "es": {
-        "restroom": "aseo",
-        "accessible_restroom": "aseo accesible",
-        "first_aid": "puesto de primeros auxilios",
-        "concession": "puesto de comida",
-        "guest_services": "punto de atención",
-        "water": "fuente de agua",
-        "sensory_room": "sala sensorial",
-        "exit": "salida",
-        "gate": "puerta",
-        "seat": "asiento",
-        "elevator": "ascensor",
-    },
-    "fr": {
-        "restroom": "toilettes",
-        "accessible_restroom": "toilettes accessibles",
-        "first_aid": "poste de premiers secours",
-        "concession": "point de restauration",
-        "guest_services": "comptoir d'accueil",
-        "water": "point d'eau",
-        "sensory_room": "salle sensorielle",
-        "exit": "sortie",
-        "gate": "porte",
-        "seat": "place",
-        "elevator": "ascenseur",
-    },
-}
-
-# Route-step sentence templates; {verb}, {to}, {name}, {lm} are substituted at render time.
-_STEP: dict[str, dict[str, str]] = {
-    "en": {
-        "final": "{verb} to {to}, where you'll find {name}{lm}.",
-        "mid": "{verb} to {to}.",
-    },
-    "es": {
-        "final": "{verb} hasta {to}, donde encontrará {name}{lm}.",
-        "mid": "{verb} hasta {to}.",
-    },
-    "fr": {
-        "final": "{verb} jusqu'à {to}, où se trouve {name}{lm}.",
-        "mid": "{verb} jusqu'à {to}.",
-    },
-}
-
-_ALT_NOTE: dict[str, str] = {
-    "en": "A closer {label} was crowded, so a quieter one is suggested.",
-    "es": "Un {label} más cercano estaba muy concurrido; se sugiere una opción más tranquila.",
-    "fr": "Un(e) {label} plus proche était bondé(e) : une option plus calme est proposée.",
-}
-
-_URGENCY: dict[str, str] = {
-    "en": "Kickoff in under 15 minutes — please hurry.",
-    "es": "El partido comienza en menos de 15 minutos: dese prisa.",
-    "fr": "Coup d'envoi dans moins de 15 minutes — dépêchez-vous.",
-}
-
-# Sentence fragments composed into the full answer paragraph by render_answer.
-_ANSWER: dict[str, dict[str, str]] = {
-    "en": {
-        "dest": "Your destination is {name}{lm}.",
-        "here": "You're already at this location.",
-        "route": "Follow the {n}-step route below (about {d} m).",
-        "crowd": "Crowd level there is currently {c}.",
-        "landmark": "These directions use landmarks and are optimized for screen readers.",
-        "captioned": (
-            "Look for visual signage on the way; "
-            "a quiet Sensory Room is available if you need it."
-        ),
-        "hurry": "Kickoff is very soon — please head there quickly.",
-    },
-    "es": {
-        "dest": "Su destino es {name}{lm}.",
-        "here": "Ya se encuentra en este lugar.",
-        "route": "Siga la ruta de abajo en {n} paso(s) (unos {d} m).",
-        "crowd": "La afluencia allí es actualmente {c}.",
-        "landmark": (
-            "Estas indicaciones se basan en puntos de referencia "
-            "y están optimizadas para lectores de pantalla."
-        ),
-        "captioned": (
-            "Busque la señalización visual por el camino; "
-            "hay una sala sensorial tranquila disponible si la necesita."
-        ),
-        "hurry": "El partido está a punto de comenzar: diríjase allí rápidamente.",
-    },
-    "fr": {
-        "dest": "Votre destination est {name}{lm}.",
-        "here": "Vous y êtes déjà.",
-        "route": "Suivez l'itinéraire ci-dessous en {n} étape(s) (environ {d} m).",
-        "crowd": "L'affluence sur place est actuellement {c}.",
-        "landmark": (
-            "Ces indications s'appuient sur des points de repère "
-            "et sont optimisées pour les lecteurs d'écran."
-        ),
-        "captioned": (
-            "Repérez la signalétique visuelle en chemin ; "
-            "une salle sensorielle calme est disponible au besoin."
-        ),
-        "hurry": "Le coup d'envoi est imminent — rendez-vous-y rapidement.",
-    },
-}
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-def _lang(language: str) -> str:
-    """Return a supported language key, falling back to the default language.
-
-    Args:
-        language: ISO 639-1 language code requested by the caller.
-
-    Returns:
-        The ``language`` string if it exists in the localization tables,
-        otherwise :data:`~app.utils.constants.DEFAULT_LANGUAGE` (``"en"``).
-    """
-    return language if language in _MEANS else DEFAULT_LANGUAGE
-
-
-def _cap(text: str) -> str:
-    """Capitalize the first character of a string, leaving the rest unchanged.
-
-    Used to capitalize movement verbs at the start of route-step sentences
-    while preserving the casing of multi-word phrases (e.g. ``"take the ramp"``
-    → ``"Take the ramp"``).
-
-    Args:
-        text: The string to capitalize.
-
-    Returns:
-        The input string with its first character upper-cased, or the
-        original string if it is empty.
-    """
-    return text[:1].upper() + text[1:] if text else text
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
-def type_label(facility_type: str, language: str) -> str:
-    """Return the localized display label for a facility type string.
-
-    Args:
-        facility_type: Internal facility type key (e.g. ``"accessible_restroom"``).
-        language: ISO 639-1 language code for the desired translation.
-
-    Returns:
-        Localized label string (e.g. ``"accessible restroom"`` in English).
-        Falls back to the type string with underscores replaced by spaces
-        if the type is not in the localization table.
-    """
-    lang = _lang(language)
-    return _TYPE_LABEL[lang].get(facility_type, facility_type.replace("_", " "))
-
-
-def step_instruction(
-    means: str,
-    to_name: str,
-    landmark: str | None,
-    *,
-    is_final: bool,
-    facility_name: str,
-    language: str,
-) -> str:
-    """Build one localized route-step instruction sentence.
-
-    Selects the appropriate sentence template (``"final"`` for the last step,
-    ``"mid"`` for intermediate steps) and substitutes the travel verb,
-    destination name, facility name, and optional landmark.
-
-    Args:
-        means: Travel means key (``"walk"``, ``"ramp"``, ``"elevator"``,
-            ``"stairs"``). Unknown means default to ``"walk"``.
-        to_name: Localized name of the destination zone for this step.
-        landmark: Localized landmark description shown on the final step,
-            or ``None`` if no landmark is defined for the facility.
-        is_final: ``True`` if this is the last step in the route, which
-            triggers the longer template that names the facility and landmark.
-        facility_name: Localized name of the target facility, injected into
-            the final-step template only.
-        language: ISO 639-1 language code for the localization lookup.
-
-    Returns:
-        A complete, capitalized instruction sentence for this route step.
-    """
-    lang = _lang(language)
-    verb = _cap(_MEANS[lang].get(means, _MEANS[lang]["walk"]))
-    lm = f" ({landmark})" if (is_final and landmark) else ""
-    template = _STEP[lang]["final" if is_final else "mid"]
-    return template.format(verb=verb, to=to_name, name=facility_name, lm=lm)
-
-
-def alternatives_note(facility_type: str, language: str) -> str:
-    """Return a localized note explaining a crowd-avoidance facility swap.
-
-    Called when the nearest facility for an intent was at high crowd level
-    and the engine selected a quieter alternative instead.
-
-    Args:
-        facility_type: The type of the alternative facility selected
-            (e.g. ``"restroom"``), used to insert the localized type label.
-        language: ISO 639-1 language code for the localization lookup.
-
-    Returns:
-        A complete localized sentence explaining that a quieter alternative
-        was suggested due to crowd congestion at the nearest facility.
-    """
-    lang = _lang(language)
-    return _ALT_NOTE[lang].format(label=type_label(facility_type, lang))
-
-
-def urgency_note(language: str) -> str:
-    """Return a localized urgency banner string for imminent kickoff.
-
-    Displayed when ``minutes_to_kickoff < KICKOFF_URGENCY_MINUTES`` and
-    the fan's destination intent is time-sensitive (gate or seat).
-
-    Args:
-        language: ISO 639-1 language code for the localization lookup.
-
-    Returns:
-        A short localized urgency sentence advising the fan to hurry.
-    """
-    return _URGENCY[_lang(language)]
 
 
 @dataclass(frozen=True)
 class PhrasingContext:
-    """Hashable snapshot of all facts needed to compose the final answer.
-
-    Being a frozen dataclass makes instances hashable, enabling
-    :func:`render_answer` to be memoized with ``lru_cache``. All fields
-    are derived from :class:`~app.models.schemas.DecisionResult` and must
-    be primitive types or immutable values to preserve hashability.
+    """Read-only container for all resolved routing facts.
 
     Attributes:
-        language: ISO 639-1 language code for the response.
-        facility_name: Localized name of the resolved target facility.
-        facility_type: Type key of the resolved facility.
-        facility_landmark: Localized landmark description, or ``None``.
-        crowd_level: Simulated crowd level string (``"low"``/``"medium"``/``"high"``).
-        accessibility_mode: Presentation mode string from the rules engine.
-        landmark_based: ``True`` when landmark-based instructions are active.
-        hurry: ``True`` when kickoff is imminent and the intent is time-sensitive.
-        alternative_type: Facility type of the crowd-avoidance swap, or ``None``.
-        total_distance: Sum of all route step distances in metres.
-        step_count: Number of route steps in the path.
+        language: ISO 639-1 language code.
+        facility_name: Localized name of the target facility.
+        facility_type: Category of the target facility.
+        facility_landmark: Optional localized landmark description.
+        crowd_level: Resolved crowd index ('low', 'medium', 'high').
+        accessibility_mode: Selected display mode (standard, captioned, etc).
+        landmark_based: True if route instructions should emphasize landmarks.
+        hurry: True if the user is rushing to a time-sensitive destination.
+        alternative_type: Facility type of the alternative if a crowd-swap occurred.
+        total_distance: Total journey distance in metres.
+        step_count: Number of edges in the route.
     """
-
     language: str
     facility_name: str
     facility_type: str
@@ -360,49 +74,501 @@ class PhrasingContext:
     step_count: int
 
 
-@lru_cache(maxsize=256)
-def render_answer(ctx: PhrasingContext) -> str:
-    """Compose the full localized answer paragraph from a phrasing context.
+def _lang(strings: dict[str, Any], lang: str) -> Any:
+    """Retrieve the value for a language code, falling back to DEFAULT_LANGUAGE.
 
-    Assembles a natural-language paragraph by joining selected sentence
-    fragments from the ``_ANSWER`` tables based on the flags and values in
-    ``ctx``. The result is memoized: identical :class:`PhrasingContext`
-    instances (same frozen field values) return the cached string without
-    re-executing any formatting logic.
-
-    This function is the core of the short-circuit path (no LLM) and also
-    the fallback used by :class:`~app.services.llm.MockLLM`.
+    Looks up ``lang`` in ``strings``. If not present, falls back to the
+    value stored under ``DEFAULT_LANGUAGE`` (English). Returns an empty
+    string if neither key exists.
 
     Args:
-        ctx: A frozen :class:`PhrasingContext` snapshot containing all
-            facts needed to phrase the response.
+        strings: A dict mapping ISO 639-1 language codes to translated values.
+        lang: The requested ISO 639-1 language code (e.g. ``'en'``, ``'fr'``).
 
     Returns:
-        A localized answer paragraph as a single space-joined string of
-        all applicable sentence fragments.
-    """
-    lang = _lang(ctx.language)
-    a = _ANSWER[lang]
-    crowd = _CROWD_WORD[lang][ctx.crowd_level]
-    dest_lm = f" ({ctx.facility_landmark})" if ctx.facility_landmark else ""
+        The translated value for ``lang``, the DEFAULT_LANGUAGE fallback, or
+        an empty string when neither key is present.
 
-    parts = [a["dest"].format(name=ctx.facility_name, lm=dest_lm)]
+    Raises:
+        None
+
+    Example:
+        >>> _lang({"en": "Walk to {}", "fr": "Marchez vers {}"}, "fr")
+        'Marchez vers {}'
+        >>> _lang({"en": "Walk to {}"}, "es")
+        'Walk to {}'
+    """
+    return strings.get(lang, strings.get(DEFAULT_LANGUAGE, ""))
+
+
+def _cap(text: str) -> str:
+    """Capitalise the first letter of a string, leaving the rest unchanged.
+
+    Args:
+        text: The string whose first character should be uppercased.
+
+    Returns:
+        The input string with its first character converted to uppercase.
+        Returns the original string unchanged if it is empty.
+
+    Raises:
+        None
+
+    Example:
+        >>> _cap("walk to gate a")
+        'Walk to gate a'
+        >>> _cap("")
+        ''
+    """
+    return text[:1].upper() + text[1:] if text else text
+
+
+def type_label(facility_type: str, language: str) -> str:
+    """Return the localized display label for a given facility type string.
+
+    Performs a dictionary lookup for common facility types. For unknown types,
+    replaces underscores with spaces and returns the result in English.
+
+    Args:
+        facility_type: The internal facility type key (e.g. ``'restroom'``,
+            ``'first_aid'``, ``'gate'``).
+        language: ISO 639-1 language code for the desired output language.
+
+    Returns:
+        A human-readable localized string for the facility type (e.g.
+        ``'toilettes'`` for ``('restroom', 'fr')``).
+
+    Raises:
+        None
+
+    Example:
+        >>> type_label("restroom", "fr")
+        'toilettes'
+        >>> type_label("restroom", "es")
+        'aseo'
+        >>> type_label("mystery_facility", "en")
+        'mystery facility'
+    """
+    labels: dict[str, dict[str, str]] = {
+        "restroom": {"en": "restroom", "es": "aseo", "fr": "toilettes"},
+        "gate": {"en": "gate", "es": "puerta", "fr": "porte"},
+        "first_aid": {"en": "first aid", "es": "primeros auxilios", "fr": "premiers secours"},
+    }
+    return _lang(labels.get(facility_type, {"en": facility_type.replace("_", " ")}), language)  # type: ignore[no-any-return]
+
+
+def _build_base_instruction(means: str, zone_name: str, language: str) -> str:
+    """Build the base movement instruction sentence without landmark or arrival text.
+
+    Selects the appropriate verb phrase template for the given transit means
+    and formats it with the destination zone name.
+
+    Args:
+        means: The mode of transit (``'walk'``, ``'ramp'``, ``'elevator'``,
+            ``'stairs'``). Falls back to the ``'walk'`` template for unknown values.
+        zone_name: The localized display name of the destination zone.
+        language: ISO 639-1 language code for the output.
+
+    Returns:
+        A single formatted instruction sentence without landmark or arrival
+        suffix (e.g. ``'Walk to Lower Concourse'``).
+
+    Raises:
+        None
+
+    Example:
+        >>> _build_base_instruction("elevator", "Upper Concourse", "en")
+        'Take the elevator to Upper Concourse'
+        >>> _build_base_instruction("walk", "Puerta Norte", "es")
+        'Camine hacia Puerta Norte'
+    """
+    templates: dict[str, dict[str, str]] = {
+        "walk": {"en": "Walk to {}", "es": "Camine hacia {}", "fr": "Marchez jusqu'à {}"},
+        "ramp": {"en": "Take the ramp to {}", "es": "Tome la rampa hacia {}", "fr": "Prenez la rampe vers {}"},
+        "elevator": {"en": "Take the elevator to {}", "es": "Tome el ascensor a {}", "fr": "Prenez l'ascenseur vers {}"},
+        "stairs": {"en": "Take the stairs to {}", "es": "Tome las escaleras a {}", "fr": "Prenez les escaliers vers {}"},
+    }
+    base = _lang(templates.get(means, templates["walk"]), language)
+    return str(base).format(zone_name)
+
+
+def _append_landmark(base: str, landmark: str | None, language: str) -> str:
+    """Append a localized landmark hint to a base instruction string if one is present.
+
+    If ``landmark`` is ``None`` or empty, the original ``base`` string is
+    returned unchanged.
+
+    Args:
+        base: The base instruction string already containing the movement verb
+            and destination (e.g. ``'Walk to Lower Concourse'``).
+        landmark: Optional landmark description string. If falsy, this function
+            is a no-op.
+        language: ISO 639-1 language code used to select the correct template.
+
+    Returns:
+        The ``base`` string with the landmark parenthetical appended, e.g.
+        ``'Walk to Lower Concourse (look for: beside the elevator)'``.
+        Returns ``base`` unchanged when ``landmark`` is falsy.
+
+    Raises:
+        None
+
+    Example:
+        >>> _append_landmark("Walk to Gate A", "beside the escalator", "en")
+        'Walk to Gate A (look for: beside the escalator)'
+        >>> _append_landmark("Walk to Gate A", None, "en")
+        'Walk to Gate A'
+    """
+    if not landmark:
+        return base
+    templates: dict[str, str] = {
+        "en": "{} (look for: {})",
+        "es": "{} (busque: {})",
+        "fr": "{} (cherchez : {})",
+    }
+    return str(_lang(templates, language)).format(base, landmark)
+
+
+def _append_arrival(base: str, is_final: bool, facility_name: str, language: str) -> str:
+    """Append a localized arrival confirmation to the instruction for the final step.
+
+    For intermediate steps, simply appends a period. For the final step,
+    appends an arrival clause naming the target facility.
+
+    Args:
+        base: The assembled base instruction (possibly with landmark).
+        is_final: If ``True``, appends the arrival clause; otherwise appends
+            just a period to terminate the sentence.
+        facility_name: The localized display name of the target facility,
+            used only when ``is_final=True``.
+        language: ISO 639-1 language code for the arrival clause template.
+
+    Returns:
+        The completed step instruction string. For final steps this ends with
+        the facility name (e.g. ``'… to arrive at Gate A.'``); for intermediate
+        steps it ends with a period.
+
+    Raises:
+        None
+
+    Example:
+        >>> _append_arrival("Take the elevator to Upper Concourse", True, "Gate A", "en")
+        'Take the elevator to Upper Concourse to arrive at Gate A.'
+        >>> _append_arrival("Walk to Lower Concourse", False, "Gate A", "en")
+        'Walk to Lower Concourse.'
+    """
+    if not is_final:
+        return base + "."
+    arr: dict[str, str] = {
+        "en": " to arrive at {}.",
+        "es": " donde encontrará {}.",
+        "fr": " où se trouve {}.",
+    }
+    return base + str(_lang(arr, language)).format(facility_name)
+
+
+def step_instruction(
+    means: str,
+    zone_name: str,
+    landmark: str | None,
+    *,
+    is_final: bool,
+    facility_name: str,
+    language: str,
+) -> str:
+    """Format a complete, localized, step-by-step route instruction.
+
+    Composes the three sub-components — movement verb, optional landmark
+    hint, and arrival clause — into a single instruction sentence.
+
+    Args:
+        means: Transit mode string (``'walk'``, ``'ramp'``, ``'elevator'``,
+            ``'stairs'``).
+        zone_name: Localized display name of the destination zone for this step.
+        landmark: Optional localized landmark string shown parenthetically.
+        is_final: If ``True``, appends an arrival confirmation at the destination.
+        facility_name: Name of the ultimate target facility (used only on
+            the final step for the arrival clause).
+        language: ISO 639-1 language code for all output strings.
+
+    Returns:
+        A single complete, localized instruction sentence for this route step,
+        e.g. ``'Take the elevator to Upper West (look for: beside the lobby) to arrive at Gate A.'``
+
+    Raises:
+        None
+
+    Example:
+        >>> step_instruction("elevator", "Upper Concourse", "near the lobby",
+        ...                  is_final=True, facility_name="Restroom", language="fr")
+        "Prenez l'ascenseur vers Upper Concourse (cherchez : near the lobby) où se trouve Restroom."
+    """
+    base = _build_base_instruction(means, zone_name, language)
+    with_lm = _append_landmark(base, landmark, language)
+    return _append_arrival(with_lm, is_final, facility_name, language)
+
+
+def alternatives_note(alternative_type: str, language: str) -> str:
+    """Format a localized notice explaining that a quieter alternative facility was selected.
+
+    Used when the primary facility is at high crowd level and the engine
+    has swapped to a less congested alternative.
+
+    Args:
+        alternative_type: The internal type key of the alternative facility
+            (e.g. ``'restroom'``, ``'concession'``).
+        language: ISO 639-1 language code for the output message.
+
+    Returns:
+        A full localized sentence explaining the crowd-based rerouting, e.g.
+        ``'To avoid crowds, we have routed you to a quieter restroom.'``
+
+    Raises:
+        None
+
+    Example:
+        >>> alternatives_note("restroom", "en")
+        'To avoid crowds, we have routed you to a quieter restroom.'
+        >>> alternatives_note("concession", "fr")
+        'Pour éviter la foule, nous vous avons dirigé vers un restauration plus calme.'
+    """
+    label: str = type_label(alternative_type, language)
+    templates: dict[str, str] = {
+        "en": f"To avoid crowds, we have routed you to a quieter {label}.",
+        "es": f"Para evitar aglomeraciones, le hemos dirigido a un {label} más tranquila.",
+        "fr": f"Pour éviter la foule, nous vous avons dirigé vers un {label} plus calme.",
+    }
+    return str(_lang(templates, language))
+
+
+def urgency_note(language: str) -> str:
+    """Format a localized urgency warning when kickoff is imminent.
+
+    Called when ``minutes_to_kickoff`` is within the threshold defined by
+    ``KICKOFF_URGENCY_MINUTES`` and the destination is a gate or seat.
+
+    Args:
+        language: ISO 639-1 language code for the output message.
+
+    Returns:
+        A localized urgency warning string encouraging the fan to hurry to
+        their gate or seat before the match starts.
+
+    Raises:
+        None
+
+    Example:
+        >>> urgency_note("en")
+        'Kickoff is approaching — hurry, please head there quickly.'
+        >>> urgency_note("fr")
+        "Le coup d'envoi est imminent — dépêchez-vous."
+    """
+    templates: dict[str, str] = {
+        "en": "Kickoff is approaching — hurry, please head there quickly.",
+        "es": "El inicio se acerca: dese prisa y diríjase allí.",
+        "fr": "Le coup d'envoi est imminent — dépêchez-vous.",
+    }
+    return str(_lang(templates, language))
+
+
+def _build_answer_intro(ctx: PhrasingContext) -> str:
+    """Build the opening introduction sentence for the templated answer.
+
+    Produces either an "already here" message (when ``step_count == 0``) or
+    a route summary sentence stating the distance and number of steps.
+
+    Args:
+        ctx: The frozen :class:`PhrasingContext` containing all resolved facts.
+
+    Returns:
+        A single localized sentence — either confirming the fan is already
+        at the destination, or summarising the route length and step count.
+
+    Raises:
+        None
+
+    Example:
+        >>> ctx = PhrasingContext(language="en", facility_name="Gate A",
+        ...     facility_type="gate", facility_landmark=None, crowd_level="low",
+        ...     accessibility_mode="standard", landmark_based=False, hurry=False,
+        ...     alternative_type=None, total_distance=0, step_count=0)
+        >>> _build_answer_intro(ctx)
+        'You are already at this location.'
+    """
     if ctx.step_count == 0:
-        # Fan is already at the destination — no navigation needed.
-        parts.append(a["here"])
-    else:
-        parts.append(a["route"].format(n=ctx.step_count, d=ctx.total_distance))
-    parts.append(a["crowd"].format(c=crowd))
-    if ctx.alternative_type:
-        # A quieter alternative was selected — explain why.
-        parts.append(alternatives_note(ctx.alternative_type, lang))
-    if ctx.landmark_based:
-        # Visual accessibility mode — note that landmark instructions are used.
-        parts.append(a["landmark"])
+        templates_zero = {
+            "en": "You are already at this location.",
+            "es": "Ya se encuentra en Su destino.",
+            "fr": "Vous y êtes déjà.",
+        }
+        return str(_lang(templates_zero, ctx.language))
+
+    templates = {
+        "en": "Your route to {name} is {dist}m long and takes {steps} steps.",
+        "es": "Su destino {name} está a {dist}m y {steps} pasos.",
+        "fr": "Votre destination {name} est à {dist}m en {steps} étapes.",
+    }
+    intro = str(_lang(templates, ctx.language))
+    return intro.format(name=ctx.facility_name, dist=ctx.total_distance, steps=ctx.step_count)
+
+
+def _build_answer_crowd(ctx: PhrasingContext) -> str:
+    """Build the crowd-level context sentence for the templated answer.
+
+    Appends a localized description of the current crowd level at the
+    destination zone to help the fan plan accordingly.
+
+    Args:
+        ctx: The frozen :class:`PhrasingContext` containing all resolved facts.
+
+    Returns:
+        A single localized sentence about current crowd density at the
+        destination, e.g. ``' Current crowd level at destination is moderate.'``
+
+    Raises:
+        None
+
+    Example:
+        >>> ctx = PhrasingContext(language="en", facility_name="Restroom",
+        ...     facility_type="restroom", facility_landmark=None, crowd_level="medium",
+        ...     accessibility_mode="standard", landmark_based=False, hurry=False,
+        ...     alternative_type=None, total_distance=50, step_count=1)
+        >>> _build_answer_crowd(ctx)
+        ' Current crowd level at destination is moderate.'
+    """
+    templates: dict[str, str] = {
+        "en": " Current crowd level at destination is {crowd}.",
+        "es": " La afluencia actual en el destino es {crowd}.",
+        "fr": " L'affluence actuelle à destination est {crowd}.",
+    }
+    crowds: dict[str, dict[str, str]] = {
+        "low": {"en": "low", "es": "baja", "fr": "faible"},
+        "medium": {"en": "moderate", "es": "moderada", "fr": "modérée"},
+        "high": {"en": "high", "es": "alta", "fr": "élevée"},
+    }
+    crowd_str = str(_lang(crowds.get(ctx.crowd_level, crowds["low"]), ctx.language))
+    return str(_lang(templates, ctx.language)).format(crowd=crowd_str)
+
+
+def _build_answer_lm(ctx: PhrasingContext) -> str:
+    """Build the landmark lookup sentence for the templated answer, if applicable.
+
+    Returns a non-empty string only when ``landmark_based=True`` and a
+    ``facility_landmark`` is available in the context.
+
+    Args:
+        ctx: The frozen :class:`PhrasingContext` containing all resolved facts.
+
+    Returns:
+        A localized sentence directing the fan to look for the landmark
+        (e.g. ``' Look for: beside the elevator.'``), or an empty string
+        when landmarks are not applicable.
+
+    Raises:
+        None
+
+    Example:
+        >>> ctx = PhrasingContext(language="en", facility_name="Restroom",
+        ...     facility_type="restroom", facility_landmark="beside the elevator",
+        ...     crowd_level="low", accessibility_mode="screen_reader",
+        ...     landmark_based=True, hurry=False, alternative_type=None,
+        ...     total_distance=80, step_count=2)
+        >>> _build_answer_lm(ctx)
+        ' Look for: beside the elevator.'
+    """
+    if not ctx.landmark_based or not ctx.facility_landmark:
+        return ""
+    templates: dict[str, str] = {
+        "en": " Look for: {lm}.",
+        "es": " Busque: {lm}.",
+        "fr": " Cherchez : {lm}.",
+    }
+    return str(_lang(templates, ctx.language)).format(lm=ctx.facility_landmark)
+
+
+def _build_answer_mode(ctx: PhrasingContext) -> str:
+    """Build the accessibility mode notification suffix for the templated answer.
+
+    Returns an empty string in standard mode. For ``screen_reader`` mode
+    or when ``landmark_based=True``, appends a screen-reader optimisation
+    notice. For ``captioned`` mode, additionally appends a sensory room notice.
+
+    Args:
+        ctx: The frozen :class:`PhrasingContext` containing all resolved facts.
+
+    Returns:
+        Zero, one, or two localized accessbility mode suffix sentences
+        concatenated together, e.g.
+        ``' Optimized for screen readers. Signage mode (Sensory Room available).'``
+        Returns an empty string for standard mode with no landmarks.
+
+    Raises:
+        None
+
+    Example:
+        >>> ctx = PhrasingContext(language="en", facility_name="Restroom",
+        ...     facility_type="restroom", facility_landmark=None, crowd_level="low",
+        ...     accessibility_mode="screen_reader", landmark_based=True, hurry=False,
+        ...     alternative_type=None, total_distance=50, step_count=1)
+        >>> _build_answer_mode(ctx)
+        ' Optimized for screen readers.'
+    """
+    res: list[str] = []
+    if ctx.accessibility_mode == "screen_reader" or ctx.landmark_based:
+        templates = {
+            "en": " Optimized for screen readers.",
+            "es": " Optimizado para lectores de pantalla.",
+            "fr": " Optimisé pour lecteurs d'écran.",
+        }
+        res.append(str(_lang(templates, ctx.language)))
     if ctx.accessibility_mode == "captioned":
-        # Hearing accessibility mode — point to visual signage and sensory room.
-        parts.append(a["captioned"])
+        templates_cap = {
+            "en": " Signage mode (Sensory Room available).",
+            "es": " Modo señalización (sala sensorial disponible).",
+            "fr": " Mode signalétique (salle sensorielle disponible).",
+        }
+        res.append(str(_lang(templates_cap, ctx.language)))
+    return "".join(res)
+
+
+def render_answer(ctx: PhrasingContext) -> str:
+    """Compose the full templated offline answer from all sub-components.
+
+    This is the primary offline answer generator and the fallback used by
+    :class:`~app.services.llm.MockLLM`. It assembles the introduction,
+    optional alternatives and urgency notes, crowd status, landmark hint,
+    and accessibility mode suffix into a single coherent response.
+
+    Args:
+        ctx: The frozen :class:`PhrasingContext` containing all resolved facts
+            from the rules engine.
+
+    Returns:
+        A stripped, localized string containing the complete answer ready to
+        be returned in the ``AssistResponse.answer`` field.
+
+    Raises:
+        None
+
+    Example:
+        >>> from app.services.phrasing import PhrasingContext, render_answer
+        >>> ctx = PhrasingContext(
+        ...     language="en", facility_name="Gate A", facility_type="gate",
+        ...     facility_landmark=None, crowd_level="low",
+        ...     accessibility_mode="standard", landmark_based=False, hurry=False,
+        ...     alternative_type=None, total_distance=120, step_count=3,
+        ... )
+        >>> render_answer(ctx)
+        'Your route to Gate A is 120m long and takes 3 steps. Current crowd level at destination is low.'
+    """
+    parts: list[str] = [_build_answer_intro(ctx)]
+    if ctx.alternative_type:
+        parts.append(" " + alternatives_note(ctx.alternative_type, ctx.language))
     if ctx.hurry:
-        # Kickoff is imminent — add urgency encouragement.
-        parts.append(a["hurry"])
-    return " ".join(parts)
+        parts.append(" " + urgency_note(ctx.language))
+    parts.extend([
+        _build_answer_crowd(ctx),
+        _build_answer_lm(ctx),
+        _build_answer_mode(ctx),
+    ])
+    return "".join(parts).strip()
